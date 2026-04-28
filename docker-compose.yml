@@ -1,0 +1,51 @@
+services:
+
+  app:
+    build: .
+    container_name: slurm_ai_app
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data/chroma_db:/app/data/chroma_db
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    container_name: slurm_ai_pipelines
+    ports:
+      - "9099:9099"
+    volumes:
+      - ./pipelines:/app/pipelines
+      - ./prompts:/app/prompts
+      - ./data/chroma_db:/app/data/chroma_db
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - PIPELINES_API_KEY=igs-local-only
+      - PIPELINES_REQUIREMENTS_PATH=/app/pipelines/requirements.txt
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: slurm_ai_webui
+    ports:
+      - "3000:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OPENAI_API_BASE_URL=http://pipelines:9099
+      - OPENAI_API_KEY=igs-local-only
+    depends_on:
+      - pipelines
+    restart: unless-stopped
+
+volumes:
+  open_webui_data:

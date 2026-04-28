@@ -1,0 +1,7 @@
+slurm_ai/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/chroma_db/
+test_rag.py
