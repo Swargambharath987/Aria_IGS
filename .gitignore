@@ -1,3 +1,6 @@
+# Personal docs — local only, never pushed
+my_docs/
+
 # Python
 __pycache__/
 *.py[cod]
