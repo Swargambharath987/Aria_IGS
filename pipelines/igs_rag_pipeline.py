@@ -83,6 +83,10 @@ class Pipeline:
         messages: List[dict],
         body: dict,
     ) -> Union[str, Generator, Iterator]:
+        # NOTE: If this pipeline crashes on startup, the Pipelines server moves the .py file to
+        # /app/pipelines/failed/. To recover:
+        #   mv pipelines/failed/igs_rag_pipeline.py pipelines/igs_rag_pipeline.py
+        # then restart the Pipelines server.
 
         if user_message.strip().lower().rstrip("!,.") in GREETINGS:
             return "Hi! I'm the IGS Grid Assistant. Ask me anything about using the IGS computational grid or Slurm — job submission, GPU resources, troubleshooting, and more."
@@ -90,4 +94,17 @@ class Pipeline:
         if not any(kw in user_message.lower() for kw in SLURM_KEYWORDS):
             return "I can only help with IGS grid and Slurm-related questions. For other topics, please refer to the appropriate resource."
 
-        return self.chat_engine.stream_chat(user_message).response_gen
+        # Non-streaming call — avoids TransferEncodingError 400 caused by passing
+        # LlamaIndex's response_gen generator directly to Open WebUI Pipelines.
+        # The stream_chat().response_gen generator is incompatible with the Pipelines
+        # protocol, which expects either a plain str or a generator that yields str chunks.
+        response = self.chat_engine.chat(user_message)
+        return str(response)
+
+        # To re-enable streaming once confirmed compatible with the Pipelines protocol,
+        # replace the two lines above with:
+        #
+        #   def generate():
+        #       for chunk in self.chat_engine.stream_chat(user_message).response_gen:
+        #           yield chunk
+        #   return generate()
