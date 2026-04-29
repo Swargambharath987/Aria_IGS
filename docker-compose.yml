@@ -1,21 +1,34 @@
 services:
 
-  app:
-    build: .
-    container_name: slurm_ai_app
+  aria-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: aria-backend
     ports:
-      - "8501:8501"
+      - "8000:8000"
     volumes:
       - ./data/chroma_db:/app/data/chroma_db
-    restart: unless-stopped
+      - ./prompts:/app/prompts
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
       - OLLAMA_HOST=http://host.docker.internal:11434
+      - LLM_MODEL=gemma4:e4b
+      - API_TOKENS=igs-dev-token
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
 
-  pipelines:
-    image: ghcr.io/open-webui/pipelines:main
-    container_name: slurm_ai_pipelines
+  aria-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile.pipelines
+    container_name: aria-bridge
     ports:
       - "9099:9099"
     volumes:
@@ -25,14 +38,17 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - OLLAMA_HOST=http://host.docker.internal:11434
       - PIPELINES_API_KEY=igs-local-only
-      - PIPELINES_REQUIREMENTS_PATH=/app/pipelines/requirements.txt
+      - AGENT_API_URL=http://aria-backend:8000
+      - AGENT_API_TOKEN=igs-dev-token
+    depends_on:
+      aria-backend:
+        condition: service_healthy
     restart: unless-stopped
 
-  open-webui:
+  aria-ui:
     image: ghcr.io/open-webui/open-webui:main
-    container_name: slurm_ai_webui
+    container_name: aria-ui
     ports:
       - "3000:8080"
     volumes:
@@ -41,10 +57,10 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OPENAI_API_BASE_URL=http://pipelines:9099
+      - OPENAI_API_BASE_URL=http://aria-bridge:9099
       - OPENAI_API_KEY=igs-local-only
     depends_on:
-      - pipelines
+      - aria-bridge
     restart: unless-stopped
 
 volumes:

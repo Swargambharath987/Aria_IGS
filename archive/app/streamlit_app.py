@@ -144,11 +144,13 @@ if prompt:
         if st.session_state.lab and st.session_state.lab != "Not selected":
             augmented_prompt = f"[User is in: {st.session_state.lab}] {prompt}"
 
-        # ReAct agent — reasons then responds (multi-step internally, returns full reply)
         with st.chat_message("assistant"):
             response_placeholder = st.empty()
             response_placeholder.markdown("_Thinking..._")
-            full_reply = str(engine.chat(augmented_prompt))
+            full_reply = ""
+            for token in engine.stream_chat(augmented_prompt).response_gen:
+                full_reply += token
+                response_placeholder.markdown(full_reply + "▌")
             response_placeholder.markdown(full_reply)
 
         st.session_state.messages.append({"role": "assistant", "content": full_reply})

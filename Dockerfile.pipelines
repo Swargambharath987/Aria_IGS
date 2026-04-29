@@ -1,0 +1,4 @@
+FROM ghcr.io/open-webui/pipelines:main
+
+COPY pipelines/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
