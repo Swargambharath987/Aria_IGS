@@ -1,5 +1,22 @@
 services:
 
+  postgres:
+    image: postgres:16-alpine
+    container_name: aria-postgres
+    environment:
+      POSTGRES_DB:       aria
+      POSTGRES_USER:     aria
+      POSTGRES_PASSWORD: aria_dev_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aria -d aria"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
   aria-backend:
     build:
       context: .
@@ -16,12 +33,21 @@ services:
       - OLLAMA_HOST=http://host.docker.internal:11434
       - LLM_MODEL=gemma4:e4b
       - API_TOKENS=igs-dev-token
+      - DATABASE_URL=postgresql+psycopg2://aria:aria_dev_password@postgres:5432/aria
+      # SSH tools — set these to enable live Slurm data (leave blank to disable)
+      - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
+      - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
+      - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}
+      - SLURM_SSH_TIMEOUT=15
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 15s
     restart: unless-stopped
 
   aria-bridge:
@@ -64,4 +90,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  postgres_data:
   open_webui_data:

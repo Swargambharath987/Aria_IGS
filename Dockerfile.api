@@ -7,8 +7,13 @@ WORKDIR /app
 COPY api/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY api/main.py /app/main.py
-COPY prompts /app/prompts
+# Application code
+COPY api/main.py      /app/main.py
+COPY api/tools/       /app/tools/
+COPY db/              /app/db/
+COPY alembic/      /app/alembic/
+COPY alembic.ini   /app/alembic.ini
+COPY prompts/      /app/prompts/
 
 EXPOSE 8000
 
