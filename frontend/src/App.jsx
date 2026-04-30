@@ -1,24 +1,27 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { fetchSessions, fetchMessages, sendMessage, submitFeedback } from './api.js';
+import { fetchSessions, fetchMessages, submitFeedback, streamMessage } from './api.js';
 import './App.css';
 
 const USER_ID = import.meta.env.VITE_USER_ID || 'dev';
 
-function MessageBubble({ msg, userId, ratings, onRate }) {
+function MessageBubble({ msg, ratings, onRate }) {
   const isUser = msg.role === 'user';
   const latency = msg.latency_ms != null ? (msg.latency_ms / 1000).toFixed(2) : null;
   const rated = ratings[msg.message_id];
+  const isStreaming = msg.streaming && !msg.content;
 
   return (
     <div className={`message-row ${isUser ? 'user-row' : 'assistant-row'}`}>
       <div className={`bubble ${isUser ? 'user-bubble' : 'assistant-bubble'}`}>
-        {isUser ? (
+        {isStreaming ? (
+          <span className="dots"><span /><span /><span /></span>
+        ) : isUser ? (
           <p>{msg.content}</p>
         ) : (
           <ReactMarkdown>{msg.content}</ReactMarkdown>
         )}
-        {!isUser && (
+        {!isUser && !msg.streaming && (
           <div className="msg-meta">
             {latency && <span className="latency">{latency}s</span>}
             <button
@@ -50,6 +53,8 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [ratings, setRatings] = useState({});
   const bottomRef = useRef(null);
+  // Stable ref for the streaming placeholder id so callbacks don't capture stale closures
+  const streamingIdRef = useRef(null);
 
   const loadSessions = useCallback(async () => {
     const data = await fetchSessions(USER_ID);
@@ -62,7 +67,7 @@ export default function App() {
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading]);
+  }, [messages]);
 
   async function selectSession(sessionId) {
     setActiveSessionId(sessionId);
@@ -77,36 +82,57 @@ export default function App() {
     setRatings({});
   }
 
-  async function handleSend() {
+  function handleSend() {
     const text = input.trim();
     if (!text || loading) return;
 
     const userMsg = { message_id: `tmp-${Date.now()}`, role: 'user', content: text };
-    setMessages((prev) => [...prev, userMsg]);
+    const sid = `streaming-${Date.now()}`;
+    streamingIdRef.current = sid;
+
+    setMessages((prev) => [
+      ...prev,
+      userMsg,
+      { message_id: sid, role: 'assistant', content: '', streaming: true },
+    ]);
     setInput('');
     setLoading(true);
 
-    try {
-      const data = await sendMessage(text, activeSessionId ?? null, USER_ID);
-      const assistantMsg = {
-        message_id: data.message_id,
-        role: 'assistant',
-        content: data.response,
-        latency_ms: data.latency_ms ?? null,
-      };
-      setMessages((prev) => [...prev, assistantMsg]);
-      if (!activeSessionId) {
-        setActiveSessionId(data.session_id);
-      }
-      await loadSessions();
-    } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { message_id: `err-${Date.now()}`, role: 'assistant', content: 'Error: ' + err.message },
-      ]);
-    } finally {
-      setLoading(false);
-    }
+    streamMessage(text, activeSessionId ?? null, USER_ID, {
+      onMeta: (data) => {
+        if (!activeSessionId) setActiveSessionId(data.session_id);
+      },
+      onToken: (token) => {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last.message_id !== streamingIdRef.current) return prev;
+          return [...prev.slice(0, -1), { ...last, content: last.content + token }];
+        });
+      },
+      onDone: (data) => {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last.message_id !== streamingIdRef.current) return prev;
+          return [
+            ...prev.slice(0, -1),
+            { ...last, message_id: data.message_id, latency_ms: data.latency_ms, streaming: false },
+          ];
+        });
+        setLoading(false);
+        loadSessions();
+      },
+      onError: (err) => {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last.message_id !== streamingIdRef.current) return prev;
+          return [
+            ...prev.slice(0, -1),
+            { ...last, content: `Error: ${err.message}`, streaming: false },
+          ];
+        });
+        setLoading(false);
+      },
+    });
   }
 
   function handleKeyDown(e) {
@@ -160,18 +186,10 @@ export default function App() {
             <MessageBubble
               key={msg.message_id}
               msg={msg}
-              userId={USER_ID}
               ratings={ratings}
               onRate={handleRate}
             />
           ))}
-          {loading && (
-            <div className="message-row assistant-row">
-              <div className="bubble assistant-bubble loading-bubble">
-                <span className="dots"><span /><span /><span /></span>
-              </div>
-            </div>
-          )}
           <div ref={bottomRef} />
         </div>
 

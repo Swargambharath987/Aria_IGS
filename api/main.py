@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import uuid
@@ -10,8 +11,10 @@ from typing import List, Optional
 import chromadb
 from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
 from llama_index.core.memory import ChatMemoryBuffer
+from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
@@ -139,6 +142,31 @@ def _new_chat_engine(index, llm):
     )
 
 
+def _parse_into_nodes(docs: list, filename: str, collection: str) -> list:
+    """
+    Split documents into smaller nodes with metadata for better RAG retrieval.
+    512-token chunks with 64-token overlap prevents splitting mid-command.
+    Metadata tags let the retriever prefer institute docs over generic Slurm docs.
+    """
+    parser = SentenceSplitter(
+        chunk_size=512,
+        chunk_overlap=64,
+        paragraph_separator="\n\n",
+    )
+    nodes = parser.get_nodes_from_documents(docs)
+    priority = "high" if collection in ("slurm", "institute") else "normal"
+    for i, node in enumerate(nodes):
+        node.metadata.update({
+            "source_file": filename,
+            "collection": collection,
+            "priority": priority,
+            "chunk_index": i,
+            "total_chunks": len(nodes),
+        })
+        node.excluded_llm_metadata_keys = ["chunk_index", "total_chunks"]
+    return nodes
+
+
 # ── App lifecycle ──────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -264,6 +292,72 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _token: str = Depends(
     )
 
 
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest, _token: str = Depends(require_token)):
+    """SSE streaming version of /chat. Returns text/event-stream with typed JSON events:
+    - {type:'meta', session_id} — sent first, carries the resolved session_id
+    - {type:'token', text}      — one per LLM token as it's generated
+    - {type:'done', message_id, latency_ms} — final event after DB persist
+    - {type:'error', message}   — if something goes wrong mid-stream
+    """
+    session_id = req.session_id or str(uuid.uuid4())
+
+    if session_id not in _engines:
+        _engines[session_id] = _new_chat_engine(app.state.index, app.state.llm)
+
+    # Fetch live context before streaming starts (these are fast network calls)
+    live_tool   = needs_live_data(req.message)
+    file_action = needs_file_read(req.message)
+    context_blocks: list[str] = []
+    sources: list[dict] = []
+
+    if live_tool:
+        context_blocks.append(f"[Live cluster data]\n{get_live_data(live_tool, req.user_id, req.message)}")
+        sources.append({"tool": live_tool, "live": True})
+    if file_action:
+        context_blocks.append(f"[File contents]\n{get_file_data(file_action, req.user_id)}")
+        sources.append({"tool": "file_reader", "action": file_action["action"]})
+
+    llm_message = (
+        "\n\n".join(context_blocks) + f"\n\n[User question]\n{req.message}"
+        if context_blocks else req.message
+    )
+
+    def generate():
+        yield f"data: {json.dumps({'type': 'meta', 'session_id': session_id})}\n\n"
+
+        db = SessionLocal()
+        try:
+            user    = _get_or_create_user(db, req.user_id)
+            session = _get_or_create_session(db, session_id, user, req.message)
+
+            t0 = time.monotonic()
+            full_response = ""
+
+            for token in _engines[session_id].stream_chat(llm_message).response_gen:
+                full_response += token
+                yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            msg = _persist_exchange(db, session, req.message, full_response, latency_ms, LLM_MODEL)
+            if sources:
+                msg.sources_used = sources
+            db.commit()
+
+            yield f"data: {json.dumps({'type': 'done', 'message_id': str(msg.id), 'latency_ms': latency_ms})}\n\n"
+        except Exception as exc:
+            db.rollback()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
+        finally:
+            db.close()
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/sessions", response_model=List[SessionSummary])
 def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _token: str = Depends(require_token)):
     """List all sessions for a user, most recent first."""
@@ -370,8 +464,8 @@ def ingest(
         file_size = dest.stat().st_size
         docs = SimpleDirectoryReader(tmpdir).load_data()
 
-    for doc in docs:
-        app.state.index.insert(doc)
+    nodes = _parse_into_nodes(docs, file.filename, collection)
+    app.state.index.insert_nodes(nodes)
 
     user = _get_or_create_user(db, user_id)
     doc_record = KnowledgeDoc(
@@ -379,7 +473,7 @@ def ingest(
         original_name=file.filename,
         collection=collection,
         ingested_by=user.id,
-        chunk_count=len(docs),
+        chunk_count=len(nodes),
         file_size_bytes=file_size,
     )
     db.add(doc_record)
@@ -387,7 +481,7 @@ def ingest(
 
     return IngestResponse(
         status="ok",
-        chunks_added=len(docs),
+        chunks_added=len(nodes),
         filename=file.filename,
         doc_id=str(doc_record.id),
     )
