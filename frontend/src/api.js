@@ -1,10 +1,36 @@
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const TOKEN = import.meta.env.VITE_API_TOKEN || 'igs-dev-token';
+
+// JWT from login takes priority; fall back to static dev token for local curl-style usage
+const getToken = () =>
+  localStorage.getItem('aria_jwt') || import.meta.env.VITE_API_TOKEN || 'igs-dev-token';
 
 const headers = () => ({
   'Content-Type': 'application/json',
-  Authorization: `Bearer ${TOKEN}`,
+  Authorization: `Bearer ${getToken()}`,
 });
+
+// ── Auth ──────────────────────────────────────────────────────────────────
+
+export async function login(username, password) {
+  const res = await fetch(`${BASE_URL}/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || res.statusText);
+  }
+  return await res.json(); // { access_token, username, role }
+}
+
+export async function fetchMe() {
+  const res = await fetch(`${BASE_URL}/auth/me`, { headers: headers() });
+  if (!res.ok) throw new Error(res.statusText);
+  return await res.json(); // { username, role }
+}
+
+// ── Sessions ──────────────────────────────────────────────────────────────
 
 export async function fetchSessions(userId) {
   try {
@@ -26,15 +52,16 @@ export async function fetchMessages(sessionId) {
   }
 }
 
-export async function sendMessage(message, sessionId, userId) {
-  const res = await fetch(`${BASE_URL}/chat`, {
-    method: 'POST',
+export async function deleteSession(sessionId) {
+  const res = await fetch(`${BASE_URL}/session/${sessionId}`, {
+    method: 'DELETE',
     headers: headers(),
-    body: JSON.stringify({ message, session_id: sessionId, user_id: userId }),
   });
   if (!res.ok) throw new Error(res.statusText);
   return await res.json();
 }
+
+// ── Chat ──────────────────────────────────────────────────────────────────
 
 export async function submitFeedback(messageId, userId, rating, comment = '') {
   try {
@@ -52,10 +79,10 @@ export async function submitFeedback(messageId, userId, rating, comment = '') {
 
 /**
  * Stream a chat message via SSE. Calls callbacks as events arrive:
- *   onMeta({ session_id })        — fired first with the resolved session id
- *   onToken(text)                 — fired for each LLM token
- *   onDone({ message_id, latency_ms }) — fired when streaming is complete and DB is persisted
- *   onError(Error)                — fired on network or server error
+ *   onMeta({ session_id })
+ *   onToken(text)
+ *   onDone({ message_id, latency_ms })
+ *   onError(Error)
  */
 export function streamMessage(message, sessionId, userId, { onMeta, onToken, onDone, onError }) {
   fetch(`${BASE_URL}/chat/stream`, {
@@ -73,7 +100,6 @@ export function streamMessage(message, sessionId, userId, { onMeta, onToken, onD
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        // SSE events are separated by double newlines
         const parts = buffer.split('\n\n');
         buffer = parts.pop() ?? '';
         for (const part of parts) {
@@ -90,4 +116,43 @@ export function streamMessage(message, sessionId, userId, { onMeta, onToken, onD
       }
     })
     .catch((err) => onError?.(err));
+}
+
+// ── Admin ─────────────────────────────────────────────────────────────────
+
+export async function fetchAdminStats() {
+  const res = await fetch(`${BASE_URL}/admin/stats`, { headers: headers() });
+  if (!res.ok) throw new Error(res.statusText);
+  return await res.json();
+}
+
+export async function fetchAdminDocs(collection = null) {
+  const url = collection
+    ? `${BASE_URL}/admin/docs?collection=${collection}`
+    : `${BASE_URL}/admin/docs`;
+  const res = await fetch(url, { headers: headers() });
+  if (!res.ok) throw new Error(res.statusText);
+  return await res.json();
+}
+
+export async function deleteAdminDoc(docId) {
+  const res = await fetch(`${BASE_URL}/admin/docs/${docId}`, {
+    method: 'DELETE',
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(res.statusText);
+  return await res.json();
+}
+
+export async function ingestUrl(url, collection, userId) {
+  const res = await fetch(`${BASE_URL}/ingest/url`, {
+    method: 'POST',
+    headers: headers(),
+    body: JSON.stringify({ url, collection, user_id: userId }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || res.statusText);
+  }
+  return await res.json();
 }

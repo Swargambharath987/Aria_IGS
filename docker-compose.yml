@@ -35,6 +35,10 @@ services:
       - API_TOKENS=igs-dev-token
       - DATABASE_URL=postgresql+psycopg2://aria:aria_dev_password@postgres:5432/aria
       # SSH tools — set these to enable live Slurm data (leave blank to disable)
+      # Demo auth — replace with LDAP once IT provides AD details
+      - JWT_SECRET=${JWT_SECRET:-aria-dev-secret-change-in-prod}
+      - DEMO_USERS=${DEMO_USERS:-admin:aria_demo,user1:aria_user}
+      # SSH tools — set these to enable live Slurm data (leave blank to disable)
       - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
       - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
       - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}

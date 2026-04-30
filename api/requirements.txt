@@ -16,6 +16,11 @@ alembic==1.14.0
 
 # Auth / security
 bcrypt==4.3.0
+python-jose[cryptography]==3.3.0
+
+# URL ingestion
+requests==2.32.3
+beautifulsoup4==4.12.3
 
 # SSH tools (Slurm live data)
 paramiko==3.5.1

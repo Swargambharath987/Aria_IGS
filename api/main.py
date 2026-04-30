@@ -5,8 +5,14 @@ import uuid
 import shutil
 import tempfile
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlparse
+
+import requests as http_requests
+from bs4 import BeautifulSoup
+from jose import JWTError, jwt
 
 import chromadb
 from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
@@ -36,19 +42,40 @@ EMBED_MODEL = os.environ.get("EMBED_MODEL",        "nomic-embed-text")
 _raw_tokens  = os.environ.get("API_TOKENS", "igs-dev-token")
 VALID_TOKENS = {t.strip() for t in _raw_tokens.split(",") if t.strip()}
 
+# JWT config — stub auth until LDAP/AD is wired (Phase 3)
+JWT_SECRET    = os.environ.get("JWT_SECRET", "aria-dev-secret-change-in-prod")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_H  = 24
+
+# Demo users loaded from DEMO_USERS env var: "admin:pass,user1:pass1"
+# Replaced by LDAP validation once IT provides AD details
+DEMO_USERS: dict[str, str] = {}
+for _entry in os.environ.get("DEMO_USERS", "admin:aria_demo").split(","):
+    if ":" in _entry:
+        _u, _p = _entry.strip().split(":", 1)
+        DEMO_USERS[_u] = _p
+
 # In-memory store for LlamaIndex chat engines (stateful objects, not serializable)
 # Key: session_id (str UUID), Value: chat engine instance
 _engines: dict = {}
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
-def require_token(authorization: Optional[str] = Header(None)):
+
+def require_auth(authorization: Optional[str] = Header(None)) -> dict:
+    """Accept either a static API token (for scripts/curl) or a user JWT (from browser login)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    if token not in VALID_TOKENS:
-        raise HTTPException(status_code=403, detail="Invalid token")
-    return token
+    # Static API token — backward compat for curl and admin scripts
+    if token in VALID_TOKENS:
+        return {"username": "api", "role": "admin"}
+    # JWT issued by /auth/login
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"username": payload["sub"], "role": payload.get("role", "user")}
+    except JWTError:
+        raise HTTPException(status_code=403, detail="Invalid or expired token")
 
 
 # ── DB helpers ─────────────────────────────────────────────────────────────
@@ -236,6 +263,28 @@ class IngestResponse(BaseModel):
     doc_id:       str
 
 
+class DocOut(BaseModel):
+    doc_id:       str
+    filename:     str
+    collection:   str
+    chunk_count:  int
+    file_size_bytes: Optional[int]
+    ingested_at:  str
+    is_active:    bool
+
+
+class StatsOut(BaseModel):
+    total_users:    int
+    total_sessions: int
+    total_messages: int
+    total_docs:     int
+    total_chunks:   int
+    feedback_up:    int
+    feedback_down:  int
+    avg_latency_ms: Optional[float]
+    top_collections: list
+
+
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -245,7 +294,7 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, db: Session = Depends(get_db), _token: str = Depends(require_token)):
+def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     session_id = req.session_id or str(uuid.uuid4())
 
     # Ensure chat engine exists for this session
@@ -293,7 +342,7 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _token: str = Depends(
 
 
 @app.post("/chat/stream")
-def chat_stream(req: ChatRequest, _token: str = Depends(require_token)):
+def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
     """SSE streaming version of /chat. Returns text/event-stream with typed JSON events:
     - {type:'meta', session_id} — sent first, carries the resolved session_id
     - {type:'token', text}      — one per LLM token as it's generated
@@ -359,7 +408,7 @@ def chat_stream(req: ChatRequest, _token: str = Depends(require_token)):
 
 
 @app.get("/sessions", response_model=List[SessionSummary])
-def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _token: str = Depends(require_token)):
+def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """List all sessions for a user, most recent first."""
     user = db.query(User).filter(User.ldap_uid == user_id).first()
     if not user:
@@ -387,7 +436,7 @@ def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _token: s
 
 
 @app.get("/sessions/{session_id}/messages", response_model=List[MessageOut])
-def get_messages(session_id: str, db: Session = Depends(get_db), _token: str = Depends(require_token)):
+def get_messages(session_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """Return full message history for a session, ordered chronologically."""
     try:
         sid = uuid.UUID(session_id)
@@ -413,7 +462,7 @@ def get_messages(session_id: str, db: Session = Depends(get_db), _token: str = D
 
 
 @app.post("/feedback")
-def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db), _token: str = Depends(require_token)):
+def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """Store a thumbs up (+1) or thumbs down (-1) on an assistant message."""
     if req.rating not in (1, -1):
         raise HTTPException(status_code=400, detail="rating must be +1 or -1")
@@ -450,7 +499,7 @@ def ingest(
     user_id: str = "dev",
     collection: str = "slurm",
     db: Session = Depends(get_db),
-    _token: str = Depends(require_token),
+    _auth: dict = Depends(require_auth),
 ):
     allowed = {".pdf", ".txt", ".md"}
     suffix  = Path(file.filename).suffix.lower()
@@ -488,7 +537,7 @@ def ingest(
 
 
 @app.delete("/session/{session_id}")
-def clear_session(session_id: str, db: Session = Depends(get_db), _token: str = Depends(require_token)):
+def clear_session(session_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """Clear the in-memory LlamaIndex engine and archive the session in the DB."""
     _engines.pop(session_id, None)
 
@@ -502,3 +551,177 @@ def clear_session(session_id: str, db: Session = Depends(get_db), _token: str = 
         session.is_archived = True
 
     return {"status": "archived", "session_id": session_id}
+
+
+# ── Auth endpoints ─────────────────────────────────────────────────────────
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/auth/login")
+def auth_login(req: LoginRequest):
+    expected = DEMO_USERS.get(req.username)
+    if not expected or expected != req.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    payload = {
+        "sub": req.username,
+        "role": "admin" if req.username == "admin" else "user",
+        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_H),
+    }
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return {"access_token": token, "token_type": "bearer", "username": req.username, "role": payload["role"]}
+
+
+@app.get("/auth/me")
+def auth_me(_auth: dict = Depends(require_auth)):
+    return _auth
+
+
+# ── URL ingestion ──────────────────────────────────────────────────────────
+
+class IngestUrlRequest(BaseModel):
+    url:        str
+    collection: str = "slurm"
+    user_id:    str = "dev"
+
+
+@app.post("/ingest/url", response_model=IngestResponse)
+def ingest_url(req: IngestUrlRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+    try:
+        resp = http_requests.get(req.url, timeout=30, headers={"User-Agent": "AriaBot/1.0"})
+        resp.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {exc}")
+
+    soup = BeautifulSoup(resp.content, "html.parser")
+    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+        tag.decompose()
+    text = soup.get_text(separator="\n", strip=True)
+
+    if len(text) < 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Scraped content too short — page may require JavaScript or login",
+        )
+
+    from llama_index.core import Document
+    parsed   = urlparse(req.url)
+    filename = f"{parsed.netloc}{parsed.path.replace('/', '_')[:60]}"
+    docs     = [Document(text=text, metadata={"source_url": req.url})]
+    nodes    = _parse_into_nodes(docs, filename, req.collection)
+    app.state.index.insert_nodes(nodes)
+
+    user_id = _auth["username"] if _auth["username"] != "api" else req.user_id
+    user    = _get_or_create_user(db, user_id)
+    doc_record = KnowledgeDoc(
+        filename=filename,
+        original_name=req.url,
+        collection=req.collection,
+        source_url=req.url,
+        ingested_by=user.id,
+        chunk_count=len(nodes),
+    )
+    db.add(doc_record)
+    db.flush()
+
+    return IngestResponse(
+        status="ok",
+        chunks_added=len(nodes),
+        filename=filename,
+        doc_id=str(doc_record.id),
+    )
+
+
+# ── Admin endpoints ────────────────────────────────────────────────────────
+
+@app.get("/admin/docs", response_model=List[DocOut])
+def admin_list_docs(
+    collection: Optional[str] = None,
+    active_only: bool = True,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_auth),
+):
+    q = db.query(KnowledgeDoc)
+    if active_only:
+        q = q.filter(KnowledgeDoc.is_active == True)
+    if collection:
+        q = q.filter(KnowledgeDoc.collection == collection)
+    docs = q.order_by(KnowledgeDoc.ingested_at.desc()).all()
+    return [
+        DocOut(
+            doc_id=str(d.id),
+            filename=d.original_name,
+            collection=d.collection,
+            chunk_count=d.chunk_count,
+            file_size_bytes=d.file_size_bytes,
+            ingested_at=d.ingested_at.isoformat(),
+            is_active=d.is_active,
+        )
+        for d in docs
+    ]
+
+
+@app.delete("/admin/docs/{doc_id}")
+def admin_delete_doc(
+    doc_id: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_auth),
+):
+    try:
+        did = uuid.UUID(doc_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid doc_id format")
+
+    doc = db.query(KnowledgeDoc).filter(KnowledgeDoc.id == did).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc.is_active = False
+    db.commit()
+    return {"status": "deactivated", "doc_id": doc_id, "filename": doc.original_name}
+
+
+@app.get("/admin/stats", response_model=StatsOut)
+def admin_stats(db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+    from sqlalchemy import func as sqlfunc
+
+    total_users    = db.query(sqlfunc.count(User.id)).scalar() or 0
+    total_sessions = db.query(sqlfunc.count(DBSession.id)).scalar() or 0
+    total_messages = db.query(sqlfunc.count(Message.id)).scalar() or 0
+
+    doc_agg = db.query(
+        sqlfunc.count(KnowledgeDoc.id),
+        sqlfunc.coalesce(sqlfunc.sum(KnowledgeDoc.chunk_count), 0),
+    ).filter(KnowledgeDoc.is_active == True).one()
+    total_docs, total_chunks = doc_agg
+
+    feedback_up   = db.query(sqlfunc.count(Feedback.id)).filter(Feedback.rating == 1).scalar() or 0
+    feedback_down = db.query(sqlfunc.count(Feedback.id)).filter(Feedback.rating == -1).scalar() or 0
+
+    avg_latency = db.query(sqlfunc.avg(Message.latency_ms)).filter(
+        Message.role == MessageRole.assistant,
+        Message.latency_ms != None,
+    ).scalar()
+
+    collections = db.query(
+        KnowledgeDoc.collection,
+        sqlfunc.count(KnowledgeDoc.id).label("doc_count"),
+        sqlfunc.coalesce(sqlfunc.sum(KnowledgeDoc.chunk_count), 0).label("chunk_count"),
+    ).filter(KnowledgeDoc.is_active == True).group_by(KnowledgeDoc.collection).all()
+
+    return StatsOut(
+        total_users=total_users,
+        total_sessions=total_sessions,
+        total_messages=total_messages,
+        total_docs=total_docs,
+        total_chunks=total_chunks,
+        feedback_up=feedback_up,
+        feedback_down=feedback_down,
+        avg_latency_ms=round(avg_latency, 1) if avg_latency else None,
+        top_collections=[
+            {"collection": c.collection, "docs": c.doc_count, "chunks": c.chunk_count}
+            for c in collections
+        ],
+    )
