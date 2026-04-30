@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from db.models import Base, Feedback, KnowledgeDoc, Message, MessageRole, Session as DBSession, User, UserRole
 from db.session import SessionLocal, engine, get_db
 from tools.slurm_ssh import get_live_data, needs_live_data
+from tools.file_reader import get_file_data, needs_file_read
 
 # ── Config ─────────────────────────────────────────────────────────────────
 CHROMA_DIR  = Path(os.environ.get("CHROMA_DIR",  "/app/data/chroma_db"))
@@ -223,11 +224,24 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _token: str = Depends(
     if session_id not in _engines:
         _engines[session_id] = _new_chat_engine(app.state.index, app.state.llm)
 
-    # Fetch live cluster data if the question asks for current state
+    # Fetch live cluster data or file contents if the question needs them
     live_tool = needs_live_data(req.message)
+    file_action = needs_file_read(req.message)
+    context_blocks: list[str] = []
+    sources: list[dict] = []
+
     if live_tool:
         live_data = get_live_data(live_tool, req.user_id, req.message)
-        llm_message = f"[Live cluster data]\n{live_data}\n\n[User question]\n{req.message}"
+        context_blocks.append(f"[Live cluster data]\n{live_data}")
+        sources.append({"tool": live_tool, "live": True})
+
+    if file_action:
+        file_data = get_file_data(file_action, req.user_id)
+        context_blocks.append(f"[File contents]\n{file_data}")
+        sources.append({"tool": "file_reader", "action": file_action["action"]})
+
+    if context_blocks:
+        llm_message = "\n\n".join(context_blocks) + f"\n\n[User question]\n{req.message}"
     else:
         llm_message = req.message
 
@@ -235,7 +249,6 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _token: str = Depends(
     response = _engines[session_id].chat(llm_message)
     latency_ms = int((time.monotonic() - t0) * 1000)
     response_text = str(response)
-    sources = [{"tool": live_tool, "live": True}] if live_tool else []
 
     # Persist to PostgreSQL
     user    = _get_or_create_user(db, req.user_id)
