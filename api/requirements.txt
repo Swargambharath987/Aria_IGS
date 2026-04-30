@@ -8,6 +8,7 @@ llama-index-core==0.14.20
 llama-index-llms-ollama==0.10.1
 llama-index-embeddings-ollama==0.9.0
 llama-index-vector-stores-chroma==0.5.5
+llama-index-retrievers-bm25==0.4.0
 
 # Database
 sqlalchemy==2.0.41
@@ -24,3 +25,6 @@ beautifulsoup4==4.12.3
 
 # SSH tools (Slurm live data)
 paramiko==3.5.1
+
+# LRU cache for engine store
+cachetools==5.3.3

@@ -1,5 +1,7 @@
 import json
+import logging
 import os
+import threading
 import time
 import uuid
 import shutil
@@ -10,6 +12,8 @@ from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlparse
 
+import cachetools
+
 import requests as http_requests
 from bs4 import BeautifulSoup
 from jose import JWTError, jwt
@@ -19,13 +23,21 @@ from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
+from llama_index.core.base.llms.types import ChatMessage, MessageRole as LLMMessageRole
+from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.postprocessor.types import BaseNodePostprocessor
+from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
+from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
+from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.ollama import Ollama
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from db.models import Base, Feedback, KnowledgeDoc, Message, MessageRole, Session as DBSession, User, UserRole
 from db.session import SessionLocal, engine, get_db
@@ -57,7 +69,9 @@ for _entry in os.environ.get("DEMO_USERS", "admin:aria_demo").split(","):
 
 # In-memory store for LlamaIndex chat engines (stateful objects, not serializable)
 # Key: session_id (str UUID), Value: chat engine instance
-_engines: dict = {}
+# Capped at 50 entries; least-recently-used entry is evicted when full.
+_engines: cachetools.LRUCache = cachetools.LRUCache(maxsize=50)
+_engines_lock: threading.Lock = threading.Lock()
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
@@ -158,15 +172,163 @@ def _build_rag_index():
     return index, llm, embed, client
 
 
-def _new_chat_engine(index, llm):
-    return index.as_chat_engine(
-        chat_mode="condense_plus_context",
+# ── Priority metadata reranker ─────────────────────────────────────────────
+
+class PriorityReranker(BaseNodePostprocessor):
+    """Boost nodes tagged priority='high' by +0.15 and re-sort descending.
+
+    This postprocessor reads the ``priority`` metadata key written by
+    ``_parse_into_nodes`` at ingest time.  Nodes from the ``slurm`` and
+    ``institute`` collections are tagged "high"; everything else is "normal".
+    After the boost the list is re-sorted so high-priority chunks bubble up
+    ahead of lower-scoring normal chunks.
+    """
+
+    boost: float = 0.15
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "PriorityReranker"
+
+    def _postprocess_nodes(
+        self,
+        nodes: List[NodeWithScore],
+        query_bundle: Optional[QueryBundle] = None,
+    ) -> List[NodeWithScore]:
+        for nws in nodes:
+            if nws.node.metadata.get("priority") == "high":
+                nws.score = (nws.score or 0.0) + self.boost
+        nodes.sort(key=lambda n: n.score or 0.0, reverse=True)
+        return nodes
+
+
+# ── Hybrid retriever builder ───────────────────────────────────────────────
+
+def _build_hybrid_retriever(index: VectorStoreIndex) -> QueryFusionRetriever:
+    """Build a hybrid BM25 + vector retriever fused via reciprocal-rank fusion.
+
+    Architecture
+    ------------
+    1. VectorIndexRetriever  — cosine-similarity search over ChromaDB embeddings
+    2. BM25Retriever (optional) — term-frequency keyword search over raw node text
+       Nodes for BM25 are fetched from ChromaDB via ``index.vector_store.get_nodes``
+       because ``VectorStoreIndex.from_vector_store`` does NOT populate the
+       in-memory docstore when the vector store already stores text (stores_text=True).
+    3. QueryFusionRetriever  — merges both result lists using reciprocal-rank fusion
+       with ``num_queries=1`` (no query rewriting — just fuse as-is).
+
+    Fallback
+    --------
+    If ``llama-index-retrievers-bm25`` is not installed, the function falls back
+    to a semantic-only ``QueryFusionRetriever`` wrapping a single vector retriever.
+    Priority reranking still applies in both paths via ``PriorityReranker``.
+    """
+    # Vector retriever — always available
+    vector_retriever = VectorIndexRetriever(
+        index=index,
+        similarity_top_k=8,
+    )
+
+    retrievers = [vector_retriever]
+    mode = "semantic-only"
+
+    try:
+        from llama_index.retrievers.bm25 import BM25Retriever  # type: ignore[import]
+
+        # Fetch all stored nodes from ChromaDB (docstore is empty for from_vector_store)
+        all_nodes = index.vector_store.get_nodes(node_ids=None)
+        if all_nodes:
+            bm25_retriever = BM25Retriever.from_defaults(
+                nodes=all_nodes,
+                similarity_top_k=8,
+            )
+            retrievers.append(bm25_retriever)
+            mode = "hybrid"
+        else:
+            logger.warning(
+                "BM25Retriever: ChromaDB returned 0 nodes — falling back to semantic-only retrieval"
+            )
+    except ImportError:
+        logger.info(
+            "llama-index-retrievers-bm25 not installed; using semantic-only retrieval. "
+            "Install with: pip install llama-index-retrievers-bm25==0.4.0"
+        )
+
+    logger.info("RAG retriever mode: %s (retrievers: %d)", mode, len(retrievers))
+
+    return QueryFusionRetriever(
+        retrievers=retrievers,
+        similarity_top_k=8,
+        num_queries=1,           # no query rewriting — just fuse results as-is
+        mode=FUSION_MODES.RECIPROCAL_RANK,
+        use_async=False,
+    )
+
+
+def _new_chat_engine(index: VectorStoreIndex, llm):
+    """Build a CondensePlusContextChatEngine with hybrid retrieval + priority reranking.
+
+    Replaces the previous ``index.as_chat_engine(chat_mode='condense_plus_context', ...)``
+    call with a manually wired engine so we can inject:
+      - A hybrid BM25 + vector retriever (or semantic-only fallback)
+      - PriorityReranker postprocessor to surface high-priority chunks
+    """
+    retriever = _build_hybrid_retriever(index)
+
+    return CondensePlusContextChatEngine(
+        retriever=retriever,
         llm=llm,
         memory=ChatMemoryBuffer.from_defaults(token_limit=3000),
         system_prompt=_load_system_prompt(),
-        similarity_top_k=5,
+        node_postprocessors=[PriorityReranker()],
         verbose=False,
     )
+
+
+def _restore_engine_memory(engine, session_id: str, db: Session) -> None:
+    """Reconstruct conversation context from PostgreSQL into a freshly created engine.
+
+    This is called on cache miss (container restart or LRU eviction) so that the
+    engine has the full prior chat history rather than starting blank.
+
+    The condense_plus_context engine stores history on ``engine._memory``
+    (a ``ChatMemoryBuffer`` / ``BaseMemory`` instance).  Its ``.set()`` method
+    replaces the underlying chat-store contents atomically.
+
+    MessageRole mapping:
+      - DB MessageRole.user      → LLMMessageRole.USER
+      - DB MessageRole.assistant → LLMMessageRole.ASSISTANT
+      - DB MessageRole.tool      → LLMMessageRole.TOOL
+    """
+    try:
+        sid = uuid.UUID(session_id)
+    except ValueError:
+        return  # malformed session_id — leave engine blank
+
+    messages = (
+        db.query(Message)
+        .filter(Message.session_id == sid)
+        .order_by(Message.created_at)
+        .all()
+    )
+    if not messages:
+        return  # no prior history — brand-new session
+
+    _role_map = {
+        MessageRole.user:      LLMMessageRole.USER,
+        MessageRole.assistant: LLMMessageRole.ASSISTANT,
+        MessageRole.tool:      LLMMessageRole.TOOL,
+    }
+
+    chat_history = [
+        ChatMessage(
+            role=_role_map.get(m.role, LLMMessageRole.USER),
+            content=m.content,
+        )
+        for m in messages
+    ]
+
+    engine._memory.set(chat_history)
 
 
 def _parse_into_nodes(docs: list, filename: str, collection: str) -> list:
@@ -207,7 +369,8 @@ async def lifespan(app: FastAPI):
     app.state.embed         = embed
     app.state.chroma_client = chroma_client
     yield
-    _engines.clear()
+    with _engines_lock:
+        _engines.clear()
 
 
 app = FastAPI(title="Aria API", version="2.0.0", lifespan=lifespan)
@@ -287,19 +450,56 @@ class StatsOut(BaseModel):
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 
+MAX_MESSAGE_CHARS = 4000
+
 @app.get("/health")
-def health():
-    collection = app.state.chroma_client.get_or_create_collection("slurm")
-    return {"status": "ok", "model": LLM_MODEL, "chunks_in_db": collection.count()}
+def health(db: Session = Depends(get_db)):
+    # ChromaDB chunk count
+    chroma_collection = app.state.chroma_client.get_or_create_collection("slurm")
+    chunks = chroma_collection.count()
+
+    # Ollama reachability
+    ollama_ok = False
+    try:
+        r = http_requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        ollama_ok = r.ok
+    except Exception:
+        pass
+
+    # DB connectivity
+    db_ok = False
+    try:
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
+    status = "ok" if (ollama_ok and db_ok) else "degraded"
+    return {
+        "status":        status,
+        "model":         LLM_MODEL,
+        "chunks_in_db":  chunks,
+        "ollama_ok":     ollama_ok,
+        "db_ok":         db_ok,
+        "engines_cached": len(_engines),
+    }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(req.message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=400, detail=f"Message too long ({len(req.message)} chars). Limit: {MAX_MESSAGE_CHARS}")
     session_id = req.session_id or str(uuid.uuid4())
 
-    # Ensure chat engine exists for this session
-    if session_id not in _engines:
-        _engines[session_id] = _new_chat_engine(app.state.index, app.state.llm)
+    # Ensure chat engine exists for this session (thread-safe LRU access)
+    with _engines_lock:
+        if session_id not in _engines:
+            engine = _new_chat_engine(app.state.index, app.state.llm)
+            # Rebuild conversation context from DB on cache miss (restart / eviction)
+            _restore_engine_memory(engine, session_id, db)
+            _engines[session_id] = engine
 
     # Fetch live cluster data or file contents if the question needs them
     live_tool = needs_live_data(req.message)
@@ -322,17 +522,32 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(
     else:
         llm_message = req.message
 
+    with _engines_lock:
+        engine = _engines[session_id]
     t0 = time.monotonic()
-    response = _engines[session_id].chat(llm_message)
+    response = engine.chat(llm_message)
     latency_ms = int((time.monotonic() - t0) * 1000)
     response_text = str(response)
+
+    # Capture which RAG chunks the engine used for this answer
+    rag_sources = [
+        {
+            "type": "rag",
+            "chunk_text": node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
+            "score": round(node.score, 4) if node.score is not None else None,
+            "source_file": (node.node.metadata or {}).get("source_file") if hasattr(node, "node") else None,
+            "collection": (node.node.metadata or {}).get("collection") if hasattr(node, "node") else None,
+        }
+        for node in (getattr(response, "source_nodes", None) or [])
+    ]
+    all_sources = sources + rag_sources
 
     # Persist to PostgreSQL
     user    = _get_or_create_user(db, req.user_id)
     session = _get_or_create_session(db, session_id, user, req.message)
     msg     = _persist_exchange(db, session, req.message, response_text, latency_ms, LLM_MODEL)
-    if sources:
-        msg.sources_used = sources
+    if all_sources:
+        msg.sources_used = all_sources
 
     return ChatResponse(
         response=response_text,
@@ -349,10 +564,22 @@ def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
     - {type:'done', message_id, latency_ms} — final event after DB persist
     - {type:'error', message}   — if something goes wrong mid-stream
     """
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    if len(req.message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=400, detail=f"Message too long ({len(req.message)} chars). Limit: {MAX_MESSAGE_CHARS}")
     session_id = req.session_id or str(uuid.uuid4())
 
-    if session_id not in _engines:
-        _engines[session_id] = _new_chat_engine(app.state.index, app.state.llm)
+    with _engines_lock:
+        if session_id not in _engines:
+            # For streaming, open a short-lived DB session to restore memory
+            _db = SessionLocal()
+            try:
+                engine = _new_chat_engine(app.state.index, app.state.llm)
+                _restore_engine_memory(engine, session_id, _db)
+                _engines[session_id] = engine
+            finally:
+                _db.close()
 
     # Fetch live context before streaming starts (these are fast network calls)
     live_tool   = needs_live_data(req.message)
@@ -372,6 +599,10 @@ def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
         if context_blocks else req.message
     )
 
+    # Capture the engine reference before entering the generator (LRU-safe snapshot)
+    with _engines_lock:
+        _stream_engine = _engines[session_id]
+
     def generate():
         yield f"data: {json.dumps({'type': 'meta', 'session_id': session_id})}\n\n"
 
@@ -382,15 +613,29 @@ def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
 
             t0 = time.monotonic()
             full_response = ""
+            stream_response = _stream_engine.stream_chat(llm_message)
 
-            for token in _engines[session_id].stream_chat(llm_message).response_gen:
+            for token in stream_response.response_gen:
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
 
+            # Capture RAG source chunks used for this response
+            rag_sources = [
+                {
+                    "type": "rag",
+                    "chunk_text": node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
+                    "score": round(node.score, 4) if node.score is not None else None,
+                    "source_file": (node.node.metadata or {}).get("source_file") if hasattr(node, "node") else None,
+                    "collection": (node.node.metadata or {}).get("collection") if hasattr(node, "node") else None,
+                }
+                for node in (getattr(stream_response, "source_nodes", None) or [])
+            ]
+
             latency_ms = int((time.monotonic() - t0) * 1000)
             msg = _persist_exchange(db, session, req.message, full_response, latency_ms, LLM_MODEL)
-            if sources:
-                msg.sources_used = sources
+            all_sources = sources + rag_sources
+            if all_sources:
+                msg.sources_used = all_sources
             db.commit()
 
             yield f"data: {json.dumps({'type': 'done', 'message_id': str(msg.id), 'latency_ms': latency_ms})}\n\n"
@@ -539,7 +784,8 @@ def ingest(
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     """Clear the in-memory LlamaIndex engine and archive the session in the DB."""
-    _engines.pop(session_id, None)
+    with _engines_lock:
+        _engines.pop(session_id, None)
 
     try:
         sid = uuid.UUID(session_id)
