@@ -50,3 +50,7 @@ tmp/
 .vscode/
 *.swp
 *.swo
+
+# Node
+node_modules/
+frontend/dist/
