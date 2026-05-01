@@ -34,7 +34,6 @@ services:
       - LLM_MODEL=gemma4:e4b
       - API_TOKENS=igs-dev-token
       - DATABASE_URL=postgresql+psycopg2://aria:aria_dev_password@postgres:5432/aria
-      # SSH tools — set these to enable live Slurm data (leave blank to disable)
       # Demo auth — replace with LDAP once IT provides AD details
       - JWT_SECRET=${JWT_SECRET:-aria-dev-secret-change-in-prod}
       - DEMO_USERS=${DEMO_USERS:-admin:aria_demo,user1:aria_user}
@@ -43,6 +42,10 @@ services:
       - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
       - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}
       - SLURM_SSH_TIMEOUT=15
+      # LLM backend: "ollama" (local dev) or "vllm" (production GPU server)
+      - LLM_BACKEND=${LLM_BACKEND:-ollama}
+      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://localhost:8080/v1}
+      - VLLM_MODEL=${VLLM_MODEL:-}
     depends_on:
       postgres:
         condition: service_healthy

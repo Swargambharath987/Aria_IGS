@@ -51,6 +51,11 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST",       "http://localhost:11434")
 LLM_MODEL   = os.environ.get("LLM_MODEL",         "gemma4:e4b")
 EMBED_MODEL = os.environ.get("EMBED_MODEL",        "nomic-embed-text")
 
+# LLM backend — "ollama" (default, local dev) or "vllm" (production GPU server)
+LLM_BACKEND   = os.environ.get("LLM_BACKEND",   "ollama")
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8080/v1")
+VLLM_MODEL    = os.environ.get("VLLM_MODEL",    LLM_MODEL)
+
 _raw_tokens  = os.environ.get("API_TOKENS", "igs-dev-token")
 VALID_TOKENS = {t.strip() for t in _raw_tokens.split(",") if t.strip()}
 
@@ -159,8 +164,24 @@ def _load_system_prompt() -> str:
 
 
 def _build_rag_index():
+    # Embeddings always run via Ollama (vLLM is a text-generation server, not an embedding server)
     embed = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_HOST)
-    llm   = Ollama(model=LLM_MODEL, base_url=OLLAMA_HOST, request_timeout=120.0)
+
+    if LLM_BACKEND == "vllm":
+        from llama_index.llms.openai_like import OpenAILike  # type: ignore[import]
+        llm = OpenAILike(
+            model=VLLM_MODEL,
+            api_base=VLLM_BASE_URL,
+            api_key="not-needed",         # vLLM doesn't require a real key
+            request_timeout=120.0,
+            is_chat_model=True,
+            context_window=32768,
+        )
+        logger.info("LLM backend: vLLM — model=%s base_url=%s", VLLM_MODEL, VLLM_BASE_URL)
+    else:
+        llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_HOST, request_timeout=120.0)
+        logger.info("LLM backend: Ollama — model=%s", LLM_MODEL)
+
     Settings.llm         = llm
     Settings.embed_model = embed
 
@@ -450,7 +471,22 @@ class StatsOut(BaseModel):
 
 # ── Routes ─────────────────────────────────────────────────────────────────
 
-MAX_MESSAGE_CHARS = 4000
+MAX_MESSAGE_CHARS = 32_000
+
+
+def _source_label(collection: Optional[str], priority: Optional[str], source_url: Optional[str]) -> str:
+    """Map raw metadata fields to a human-readable source category for the UI."""
+    if source_url:
+        try:
+            domain = urlparse(source_url).netloc
+            return f"Web Source: {domain}"
+        except Exception:
+            return "Web Source"
+    if collection == "slurm":
+        return "IGS Slurm Documentation" if priority == "high" else "Official Slurm Documentation"
+    if collection == "institute":
+        return "IGS Confluence Page"
+    return collection or "Knowledge Base"
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
@@ -530,16 +566,20 @@ def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(
     response_text = str(response)
 
     # Capture which RAG chunks the engine used for this answer
-    rag_sources = [
-        {
-            "type": "rag",
-            "chunk_text": node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
-            "score": round(node.score, 4) if node.score is not None else None,
-            "source_file": (node.node.metadata or {}).get("source_file") if hasattr(node, "node") else None,
-            "collection": (node.node.metadata or {}).get("collection") if hasattr(node, "node") else None,
-        }
-        for node in (getattr(response, "source_nodes", None) or [])
-    ]
+    rag_sources = []
+    for node in (getattr(response, "source_nodes", None) or []):
+        meta = (node.node.metadata or {}) if hasattr(node, "node") else {}
+        col  = meta.get("collection")
+        pri  = meta.get("priority")
+        url  = meta.get("source_url")
+        rag_sources.append({
+            "type":        "rag",
+            "label":       _source_label(col, pri, url),
+            "chunk_text":  node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
+            "score":       round(node.score, 4) if node.score is not None else None,
+            "source_file": meta.get("source_file"),
+            "collection":  col,
+        })
     all_sources = sources + rag_sources
 
     # Persist to PostgreSQL
@@ -620,16 +660,20 @@ def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
                 yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
 
             # Capture RAG source chunks used for this response
-            rag_sources = [
-                {
-                    "type": "rag",
-                    "chunk_text": node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
-                    "score": round(node.score, 4) if node.score is not None else None,
-                    "source_file": (node.node.metadata or {}).get("source_file") if hasattr(node, "node") else None,
-                    "collection": (node.node.metadata or {}).get("collection") if hasattr(node, "node") else None,
-                }
-                for node in (getattr(stream_response, "source_nodes", None) or [])
-            ]
+            rag_sources = []
+            for node in (getattr(stream_response, "source_nodes", None) or []):
+                meta = (node.node.metadata or {}) if hasattr(node, "node") else {}
+                col  = meta.get("collection")
+                pri  = meta.get("priority")
+                url  = meta.get("source_url")
+                rag_sources.append({
+                    "type":        "rag",
+                    "label":       _source_label(col, pri, url),
+                    "chunk_text":  node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
+                    "score":       round(node.score, 4) if node.score is not None else None,
+                    "source_file": meta.get("source_file"),
+                    "collection":  col,
+                })
 
             latency_ms = int((time.monotonic() - t0) * 1000)
             msg = _persist_exchange(db, session, req.message, full_response, latency_ms, LLM_MODEL)
