@@ -30,22 +30,31 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     environment:
-      - OLLAMA_HOST=http://host.docker.internal:11434
-      - LLM_MODEL=gemma4:e4b
-      - API_TOKENS=igs-dev-token
       - DATABASE_URL=postgresql+psycopg2://aria:aria_dev_password@postgres:5432/aria
-      # Demo auth — replace with LDAP once IT provides AD details
+      - API_TOKENS=igs-dev-token
+
+      # LLM — OpenAI-compatible endpoint (Ollama /v1 locally, vLLM on GPU server)
+      # Local dev:   LLM_BASE_URL=http://host.docker.internal:11434/v1
+      # Production:  LLM_BASE_URL=http://igs-gpu:8080/v1
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-gemma4:e4b}
+      - LLM_API_KEY=${LLM_API_KEY:-not-needed}
+      - LLM_CONTEXT_WINDOW=${LLM_CONTEXT_WINDOW:-32768}
+
+      # Embeddings — always Ollama (lightweight, no GPU needed)
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - EMBED_MODEL=${EMBED_MODEL:-nomic-embed-text}
+
+      # Auth — replace DEMO_USERS with LDAP once IT provides AD details
       - JWT_SECRET=${JWT_SECRET:-aria-dev-secret-change-in-prod}
       - DEMO_USERS=${DEMO_USERS:-admin:aria_demo,user1:aria_user}
-      # SSH tools — set these to enable live Slurm data (leave blank to disable)
+
+      # SSH tools — set to enable live Slurm data (leave blank to disable)
       - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
       - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
       - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}
       - SLURM_SSH_TIMEOUT=15
-      # LLM backend: "ollama" (local dev) or "vllm" (production GPU server)
-      - LLM_BACKEND=${LLM_BACKEND:-ollama}
-      - VLLM_BASE_URL=${VLLM_BASE_URL:-http://localhost:8080/v1}
-      - VLLM_MODEL=${VLLM_MODEL:-}
+
     depends_on:
       postgres:
         condition: service_healthy

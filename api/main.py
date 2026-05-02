@@ -23,16 +23,17 @@ from fastapi import Depends, FastAPI, File, HTTPException, Header, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from llama_index.core import Settings, SimpleDirectoryReader, StorageContext, VectorStoreIndex
+from llama_index.core.agent import ReActAgent
 from llama_index.core.base.llms.types import ChatMessage, MessageRole as LLMMessageRole
-from llama_index.core.chat_engine import CondensePlusContextChatEngine
 from llama_index.core.memory import ChatMemoryBuffer
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.postprocessor.types import BaseNodePostprocessor
 from llama_index.core.retrievers import QueryFusionRetriever, VectorIndexRetriever
 from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
 from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.tools import FunctionTool
 from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
+from llama_index.llms.openai_like import OpenAILike
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -41,55 +42,55 @@ logger = logging.getLogger(__name__)
 
 from db.models import Base, Feedback, KnowledgeDoc, Message, MessageRole, Session as DBSession, User, UserRole
 from db.session import SessionLocal, engine, get_db
-from tools.slurm_ssh import get_live_data, needs_live_data
-from tools.file_reader import get_file_data, needs_file_read
+from tools.agent_tools import build_tools
 
 # ── Config ─────────────────────────────────────────────────────────────────
 CHROMA_DIR  = Path(os.environ.get("CHROMA_DIR",  "/app/data/chroma_db"))
 PROMPT_PATH = Path(os.environ.get("PROMPT_PATH", "/app/prompts/system_prompt.txt"))
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST",       "http://localhost:11434")
-LLM_MODEL   = os.environ.get("LLM_MODEL",         "gemma4:e4b")
-EMBED_MODEL = os.environ.get("EMBED_MODEL",        "nomic-embed-text")
 
-# LLM backend — "ollama" (default, local dev) or "vllm" (production GPU server)
-LLM_BACKEND   = os.environ.get("LLM_BACKEND",   "ollama")
-VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://localhost:8080/v1")
-VLLM_MODEL    = os.environ.get("VLLM_MODEL",    LLM_MODEL)
+# Embeddings always run on Ollama (lightweight, local, no GPU needed)
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+
+# LLM — OpenAI-compatible endpoint. Works with Ollama (/v1), vLLM, or any
+# other OpenAI-API-compatible server. Change the URL + model, nothing else.
+# Local dev:   LLM_BASE_URL=http://host.docker.internal:11434/v1  (Ollama)
+# Production:  LLM_BASE_URL=http://igs-gpu:8080/v1               (vLLM)
+LLM_BASE_URL      = os.environ.get("LLM_BASE_URL",      "http://localhost:11434/v1")
+LLM_MODEL         = os.environ.get("LLM_MODEL",         "gemma4:e4b")
+LLM_API_KEY       = os.environ.get("LLM_API_KEY",       "not-needed")
+LLM_CONTEXT_WINDOW = int(os.environ.get("LLM_CONTEXT_WINDOW", "32768"))
 
 _raw_tokens  = os.environ.get("API_TOKENS", "igs-dev-token")
 VALID_TOKENS = {t.strip() for t in _raw_tokens.split(",") if t.strip()}
 
-# JWT config — stub auth until LDAP/AD is wired (Phase 3)
+# JWT config — demo stub until LDAP/AD is wired (Phase 3)
 JWT_SECRET    = os.environ.get("JWT_SECRET", "aria-dev-secret-change-in-prod")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_H  = 24
 
-# Demo users loaded from DEMO_USERS env var: "admin:pass,user1:pass1"
-# Replaced by LDAP validation once IT provides AD details
+# Demo users: "admin:pass,user1:pass1" — replaced by LDAP once IT provides AD
 DEMO_USERS: dict[str, str] = {}
 for _entry in os.environ.get("DEMO_USERS", "admin:aria_demo").split(","):
     if ":" in _entry:
         _u, _p = _entry.strip().split(":", 1)
         DEMO_USERS[_u] = _p
 
-# In-memory store for LlamaIndex chat engines (stateful objects, not serializable)
-# Key: session_id (str UUID), Value: chat engine instance
-# Capped at 50 entries; least-recently-used entry is evicted when full.
-_engines: cachetools.LRUCache = cachetools.LRUCache(maxsize=50)
-_engines_lock: threading.Lock = threading.Lock()
+# Per-session conversation memory (ChatMemoryBuffer objects), capped at 50.
+# The agent itself is stateless and rebuilt per request; only memory is cached.
+_memories: cachetools.LRUCache = cachetools.LRUCache(maxsize=50)
+_memories_lock: threading.Lock = threading.Lock()
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 
 def require_auth(authorization: Optional[str] = Header(None)) -> dict:
-    """Accept either a static API token (for scripts/curl) or a user JWT (from browser login)."""
+    """Accept a static API token (scripts/curl) or a user JWT (browser login)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
     token = authorization.removeprefix("Bearer ").strip()
-    # Static API token — backward compat for curl and admin scripts
     if token in VALID_TOKENS:
         return {"username": "api", "role": "admin"}
-    # JWT issued by /auth/login
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         return {"username": payload["sub"], "role": payload.get("role", "user")}
@@ -100,21 +101,15 @@ def require_auth(authorization: Optional[str] = Header(None)) -> dict:
 # ── DB helpers ─────────────────────────────────────────────────────────────
 
 def _get_or_create_user(db: Session, ldap_uid: str) -> User:
-    """Return the User row for ldap_uid, creating it if this is the first request."""
     user = db.query(User).filter(User.ldap_uid == ldap_uid).first()
     if not user:
-        user = User(
-            ldap_uid=ldap_uid,
-            display_name=ldap_uid,
-            role=UserRole.user,
-        )
+        user = User(ldap_uid=ldap_uid, display_name=ldap_uid, role=UserRole.user)
         db.add(user)
-        db.flush()  # get user.id without committing
+        db.flush()
     return user
 
 
 def _get_or_create_session(db: Session, session_id: str, user: User, first_message: str) -> DBSession:
-    """Return the Session row, creating it with an auto-title if new."""
     sid = uuid.UUID(session_id)
     session = db.query(DBSession).filter(DBSession.id == sid).first()
     if not session:
@@ -133,12 +128,7 @@ def _persist_exchange(
     latency_ms: int,
     model: str,
 ) -> Message:
-    """Write the user turn and assistant turn to the messages table."""
-    db.add(Message(
-        session_id=session.id,
-        role=MessageRole.user,
-        content=user_message,
-    ))
+    db.add(Message(session_id=session.id, role=MessageRole.user, content=user_message))
     assistant_msg = Message(
         session_id=session.id,
         role=MessageRole.assistant,
@@ -147,41 +137,38 @@ def _persist_exchange(
         latency_ms=latency_ms,
     )
     db.add(assistant_msg)
-
-    # Bump session activity timestamp
     from sqlalchemy.sql import func
     session.last_active_at = func.now()
-
     db.flush()
     return assistant_msg
 
 
-# ── LlamaIndex engine factory ──────────────────────────────────────────────
+# ── LlamaIndex setup ───────────────────────────────────────────────────────
+
 def _load_system_prompt() -> str:
     if PROMPT_PATH.exists():
         return PROMPT_PATH.read_text().strip()
-    return "You are Aria, the IGS research computing assistant. Help users with their research workflows, SLURM jobs, bioinformatics tools, and coding."
+    return (
+        "You are Aria, the IGS research computing assistant. "
+        "Help researchers with their Slurm jobs, bioinformatics workflows, "
+        "cluster usage, and coding. Be concise, precise, and always cite your sources."
+    )
 
 
-def _build_rag_index():
-    # Embeddings always run via Ollama (vLLM is a text-generation server, not an embedding server)
+def _build_llm() -> OpenAILike:
+    """Single LLM factory — OpenAI-compatible endpoint, backend-agnostic."""
+    return OpenAILike(
+        model=LLM_MODEL,
+        api_base=LLM_BASE_URL,
+        api_key=LLM_API_KEY,
+        request_timeout=120.0,
+        is_chat_model=True,
+        context_window=LLM_CONTEXT_WINDOW,
+    )
+
+
+def _build_rag_index(llm: OpenAILike):
     embed = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_HOST)
-
-    if LLM_BACKEND == "vllm":
-        from llama_index.llms.openai_like import OpenAILike  # type: ignore[import]
-        llm = OpenAILike(
-            model=VLLM_MODEL,
-            api_base=VLLM_BASE_URL,
-            api_key="not-needed",         # vLLM doesn't require a real key
-            request_timeout=120.0,
-            is_chat_model=True,
-            context_window=32768,
-        )
-        logger.info("LLM backend: vLLM — model=%s base_url=%s", VLLM_MODEL, VLLM_BASE_URL)
-    else:
-        llm = Ollama(model=LLM_MODEL, base_url=OLLAMA_HOST, request_timeout=120.0)
-        logger.info("LLM backend: Ollama — model=%s", LLM_MODEL)
-
     Settings.llm         = llm
     Settings.embed_model = embed
 
@@ -190,20 +177,13 @@ def _build_rag_index():
     store      = ChromaVectorStore(chroma_collection=collection)
     ctx        = StorageContext.from_defaults(vector_store=store)
     index      = VectorStoreIndex.from_vector_store(store, storage_context=ctx, embed_model=embed)
-    return index, llm, embed, client
+    return index, embed, client
 
 
 # ── Priority metadata reranker ─────────────────────────────────────────────
 
 class PriorityReranker(BaseNodePostprocessor):
-    """Boost nodes tagged priority='high' by +0.15 and re-sort descending.
-
-    This postprocessor reads the ``priority`` metadata key written by
-    ``_parse_into_nodes`` at ingest time.  Nodes from the ``slurm`` and
-    ``institute`` collections are tagged "high"; everything else is "normal".
-    After the boost the list is re-sorted so high-priority chunks bubble up
-    ahead of lower-scoring normal chunks.
-    """
+    """Boost nodes tagged priority='high' by +0.15 and re-sort descending."""
 
     boost: float = 0.15
 
@@ -223,108 +203,52 @@ class PriorityReranker(BaseNodePostprocessor):
         return nodes
 
 
-# ── Hybrid retriever builder ───────────────────────────────────────────────
+# ── Hybrid retriever ───────────────────────────────────────────────────────
 
 def _build_hybrid_retriever(index: VectorStoreIndex) -> QueryFusionRetriever:
-    """Build a hybrid BM25 + vector retriever fused via reciprocal-rank fusion.
-
-    Architecture
-    ------------
-    1. VectorIndexRetriever  — cosine-similarity search over ChromaDB embeddings
-    2. BM25Retriever (optional) — term-frequency keyword search over raw node text
-       Nodes for BM25 are fetched from ChromaDB via ``index.vector_store.get_nodes``
-       because ``VectorStoreIndex.from_vector_store`` does NOT populate the
-       in-memory docstore when the vector store already stores text (stores_text=True).
-    3. QueryFusionRetriever  — merges both result lists using reciprocal-rank fusion
-       with ``num_queries=1`` (no query rewriting — just fuse as-is).
-
-    Fallback
-    --------
-    If ``llama-index-retrievers-bm25`` is not installed, the function falls back
-    to a semantic-only ``QueryFusionRetriever`` wrapping a single vector retriever.
-    Priority reranking still applies in both paths via ``PriorityReranker``.
     """
-    # Vector retriever — always available
-    vector_retriever = VectorIndexRetriever(
-        index=index,
-        similarity_top_k=8,
-    )
-
+    Build a BM25 + vector retriever fused via reciprocal-rank fusion.
+    Falls back to semantic-only if llama-index-retrievers-bm25 is not installed.
+    Built once at startup and cached on app.state — rebuilt after each ingest.
+    """
+    vector_retriever = VectorIndexRetriever(index=index, similarity_top_k=8)
     retrievers = [vector_retriever]
     mode = "semantic-only"
 
     try:
         from llama_index.retrievers.bm25 import BM25Retriever  # type: ignore[import]
-
-        # Fetch all stored nodes from ChromaDB (docstore is empty for from_vector_store)
         all_nodes = index.vector_store.get_nodes(node_ids=None)
         if all_nodes:
-            bm25_retriever = BM25Retriever.from_defaults(
-                nodes=all_nodes,
-                similarity_top_k=8,
-            )
+            bm25_retriever = BM25Retriever.from_defaults(nodes=all_nodes, similarity_top_k=8)
             retrievers.append(bm25_retriever)
             mode = "hybrid"
         else:
-            logger.warning(
-                "BM25Retriever: ChromaDB returned 0 nodes — falling back to semantic-only retrieval"
-            )
+            logger.warning("BM25: ChromaDB returned 0 nodes — falling back to semantic-only")
     except ImportError:
-        logger.info(
-            "llama-index-retrievers-bm25 not installed; using semantic-only retrieval. "
-            "Install with: pip install llama-index-retrievers-bm25==0.4.0"
-        )
+        logger.info("llama-index-retrievers-bm25 not installed; using semantic-only retrieval")
 
-    logger.info("RAG retriever mode: %s (retrievers: %d)", mode, len(retrievers))
-
+    logger.info("RAG retriever mode: %s", mode)
     return QueryFusionRetriever(
         retrievers=retrievers,
         similarity_top_k=8,
-        num_queries=1,           # no query rewriting — just fuse results as-is
+        num_queries=1,
         mode=FUSION_MODES.RECIPROCAL_RANK,
         use_async=False,
     )
 
 
-def _new_chat_engine(index: VectorStoreIndex, llm):
-    """Build a CondensePlusContextChatEngine with hybrid retrieval + priority reranking.
+# ── Agent memory ───────────────────────────────────────────────────────────
 
-    Replaces the previous ``index.as_chat_engine(chat_mode='condense_plus_context', ...)``
-    call with a manually wired engine so we can inject:
-      - A hybrid BM25 + vector retriever (or semantic-only fallback)
-      - PriorityReranker postprocessor to surface high-priority chunks
-    """
-    retriever = _build_hybrid_retriever(index)
+def _restore_agent_memory(memory: ChatMemoryBuffer, session_id: str, db: Session) -> None:
+    """Populate a fresh ChatMemoryBuffer with prior messages from PostgreSQL.
 
-    return CondensePlusContextChatEngine(
-        retriever=retriever,
-        llm=llm,
-        memory=ChatMemoryBuffer.from_defaults(token_limit=3000),
-        system_prompt=_load_system_prompt(),
-        node_postprocessors=[PriorityReranker()],
-        verbose=False,
-    )
-
-
-def _restore_engine_memory(engine, session_id: str, db: Session) -> None:
-    """Reconstruct conversation context from PostgreSQL into a freshly created engine.
-
-    This is called on cache miss (container restart or LRU eviction) so that the
-    engine has the full prior chat history rather than starting blank.
-
-    The condense_plus_context engine stores history on ``engine._memory``
-    (a ``ChatMemoryBuffer`` / ``BaseMemory`` instance).  Its ``.set()`` method
-    replaces the underlying chat-store contents atomically.
-
-    MessageRole mapping:
-      - DB MessageRole.user      → LLMMessageRole.USER
-      - DB MessageRole.assistant → LLMMessageRole.ASSISTANT
-      - DB MessageRole.tool      → LLMMessageRole.TOOL
+    Called on cache miss (container restart or LRU eviction) so the agent
+    has full conversation history rather than starting blank.
     """
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
-        return  # malformed session_id — leave engine blank
+        return
 
     messages = (
         db.query(Message)
@@ -333,68 +257,87 @@ def _restore_engine_memory(engine, session_id: str, db: Session) -> None:
         .all()
     )
     if not messages:
-        return  # no prior history — brand-new session
+        return
 
     _role_map = {
         MessageRole.user:      LLMMessageRole.USER,
         MessageRole.assistant: LLMMessageRole.ASSISTANT,
         MessageRole.tool:      LLMMessageRole.TOOL,
     }
-
     chat_history = [
-        ChatMessage(
-            role=_role_map.get(m.role, LLMMessageRole.USER),
-            content=m.content,
-        )
+        ChatMessage(role=_role_map.get(m.role, LLMMessageRole.USER), content=m.content)
         for m in messages
     ]
+    memory.set(chat_history)
 
-    engine._memory.set(chat_history)
 
+def _get_or_create_memory(session_id: str, db: Session) -> ChatMemoryBuffer:
+    """Return the cached ChatMemoryBuffer for this session, or create one from DB."""
+    with _memories_lock:
+        if session_id not in _memories:
+            memory = ChatMemoryBuffer(token_limit=LLM_CONTEXT_WINDOW // 8)
+            _restore_agent_memory(memory, session_id, db)
+            _memories[session_id] = memory
+        return _memories[session_id]
+
+
+# ── Source label ───────────────────────────────────────────────────────────
+
+def _source_label(collection: Optional[str], priority: Optional[str], source_url: Optional[str]) -> str:
+    """Map raw chunk metadata to a human-readable source category for the UI."""
+    if source_url:
+        try:
+            return f"Web Source: {urlparse(source_url).netloc}"
+        except Exception:
+            return "Web Source"
+    if collection == "slurm":
+        return "IGS Slurm Documentation" if priority == "high" else "Official Slurm Documentation"
+    if collection == "institute":
+        return "IGS Confluence Page"
+    return collection or "Knowledge Base"
+
+
+# ── Document ingestion helper ──────────────────────────────────────────────
 
 def _parse_into_nodes(docs: list, filename: str, collection: str) -> list:
-    """
-    Split documents into smaller nodes with metadata for better RAG retrieval.
-    512-token chunks with 64-token overlap prevents splitting mid-command.
-    Metadata tags let the retriever prefer institute docs over generic Slurm docs.
-    """
-    parser = SentenceSplitter(
-        chunk_size=512,
-        chunk_overlap=64,
-        paragraph_separator="\n\n",
-    )
+    parser = SentenceSplitter(chunk_size=512, chunk_overlap=64, paragraph_separator="\n\n")
     nodes = parser.get_nodes_from_documents(docs)
     priority = "high" if collection in ("slurm", "institute") else "normal"
     for i, node in enumerate(nodes):
         node.metadata.update({
-            "source_file": filename,
-            "collection": collection,
-            "priority": priority,
-            "chunk_index": i,
-            "total_chunks": len(nodes),
+            "source_file":   filename,
+            "collection":    collection,
+            "priority":      priority,
+            "chunk_index":   i,
+            "total_chunks":  len(nodes),
         })
         node.excluded_llm_metadata_keys = ["chunk_index", "total_chunks"]
     return nodes
 
 
 # ── App lifecycle ──────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Create all DB tables if they don't exist yet (idempotent — safe for dev)
-    # In production, run: alembic upgrade head
     Base.metadata.create_all(bind=engine)
 
-    index, llm, embed, chroma_client = _build_rag_index()
-    app.state.index         = index
-    app.state.llm           = llm
-    app.state.embed         = embed
-    app.state.chroma_client = chroma_client
+    llm                  = _build_llm()
+    index, embed, client = _build_rag_index(llm)
+    retriever            = _build_hybrid_retriever(index)
+
+    app.state.llm          = llm
+    app.state.index        = index
+    app.state.embed        = embed
+    app.state.chroma_client = client
+    app.state.retriever    = retriever
+
+    logger.info("Aria backend ready — LLM: %s @ %s | embed: %s", LLM_MODEL, LLM_BASE_URL, EMBED_MODEL)
     yield
-    with _engines_lock:
-        _engines.clear()
+    with _memories_lock:
+        _memories.clear()
 
 
-app = FastAPI(title="Aria API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Aria API", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -405,10 +348,11 @@ app.add_middleware(
 
 
 # ── Request / response models ──────────────────────────────────────────────
+
 class ChatRequest(BaseModel):
     message:    str
     session_id: Optional[str] = None
-    user_id:    str = "dev"     # LDAP uid — hardcoded default until Phase 3 LDAP auth
+    user_id:    str = "dev"
 
 
 class ChatResponse(BaseModel):
@@ -420,16 +364,16 @@ class ChatResponse(BaseModel):
 class FeedbackRequest(BaseModel):
     message_id: str
     user_id:    str = "dev"
-    rating:     int             # must be +1 or -1
+    rating:     int
     comment:    Optional[str] = None
 
 
 class SessionSummary(BaseModel):
-    session_id: str
-    title:      Optional[str]
-    created_at: str
+    session_id:     str
+    title:          Optional[str]
+    created_at:     str
     last_active_at: str
-    message_count: int
+    message_count:  int
 
 
 class MessageOut(BaseModel):
@@ -448,24 +392,24 @@ class IngestResponse(BaseModel):
 
 
 class DocOut(BaseModel):
-    doc_id:       str
-    filename:     str
-    collection:   str
-    chunk_count:  int
+    doc_id:          str
+    filename:        str
+    collection:      str
+    chunk_count:     int
     file_size_bytes: Optional[int]
-    ingested_at:  str
-    is_active:    bool
+    ingested_at:     str
+    is_active:       bool
 
 
 class StatsOut(BaseModel):
-    total_users:    int
-    total_sessions: int
-    total_messages: int
-    total_docs:     int
-    total_chunks:   int
-    feedback_up:    int
-    feedback_down:  int
-    avg_latency_ms: Optional[float]
+    total_users:     int
+    total_sessions:  int
+    total_messages:  int
+    total_docs:      int
+    total_chunks:    int
+    feedback_up:     int
+    feedback_down:   int
+    avg_latency_ms:  Optional[float]
     top_collections: list
 
 
@@ -474,35 +418,22 @@ class StatsOut(BaseModel):
 MAX_MESSAGE_CHARS = 32_000
 
 
-def _source_label(collection: Optional[str], priority: Optional[str], source_url: Optional[str]) -> str:
-    """Map raw metadata fields to a human-readable source category for the UI."""
-    if source_url:
-        try:
-            domain = urlparse(source_url).netloc
-            return f"Web Source: {domain}"
-        except Exception:
-            return "Web Source"
-    if collection == "slurm":
-        return "IGS Slurm Documentation" if priority == "high" else "Official Slurm Documentation"
-    if collection == "institute":
-        return "IGS Confluence Page"
-    return collection or "Knowledge Base"
-
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
-    # ChromaDB chunk count
     chroma_collection = app.state.chroma_client.get_or_create_collection("slurm")
     chunks = chroma_collection.count()
 
-    # Ollama reachability
-    ollama_ok = False
+    llm_ok = False
     try:
-        r = http_requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
-        ollama_ok = r.ok
+        r = http_requests.get(
+            LLM_BASE_URL.rstrip("/v1").rstrip("/") + "/v1/models",
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            timeout=3,
+        )
+        llm_ok = r.ok
     except Exception:
         pass
 
-    # DB connectivity
     db_ok = False
     try:
         db.execute(__import__("sqlalchemy").text("SELECT 1"))
@@ -510,181 +441,118 @@ def health(db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    status = "ok" if (ollama_ok and db_ok) else "degraded"
+    status = "ok" if (llm_ok and db_ok) else "degraded"
     return {
-        "status":        status,
-        "model":         LLM_MODEL,
-        "chunks_in_db":  chunks,
-        "ollama_ok":     ollama_ok,
-        "db_ok":         db_ok,
-        "engines_cached": len(_engines),
+        "status":          status,
+        "model":           LLM_MODEL,
+        "llm_base_url":    LLM_BASE_URL,
+        "chunks_in_db":    chunks,
+        "llm_ok":          llm_ok,
+        "db_ok":           db_ok,
+        "sessions_cached": len(_memories),
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
+async def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     if len(req.message) > MAX_MESSAGE_CHARS:
         raise HTTPException(status_code=400, detail=f"Message too long ({len(req.message)} chars). Limit: {MAX_MESSAGE_CHARS}")
+
     session_id = req.session_id or str(uuid.uuid4())
+    username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
 
-    # Ensure chat engine exists for this session (thread-safe LRU access)
-    with _engines_lock:
-        if session_id not in _engines:
-            engine = _new_chat_engine(app.state.index, app.state.llm)
-            # Rebuild conversation context from DB on cache miss (restart / eviction)
-            _restore_engine_memory(engine, session_id, db)
-            _engines[session_id] = engine
+    # Source sink — tool closures append to this list as they execute
+    source_sink: list = []
 
-    # Fetch live cluster data or file contents if the question needs them
-    live_tool = needs_live_data(req.message)
-    file_action = needs_file_read(req.message)
-    context_blocks: list[str] = []
-    sources: list[dict] = []
+    # Build agent fresh per request (stateless; only memory is cached)
+    tools  = build_tools(username, app.state.retriever, source_sink, _source_label)
+    agent  = ReActAgent(
+        tools=tools,
+        llm=app.state.llm,
+        system_prompt=_load_system_prompt(),
+        verbose=False,
+    )
+    memory = _get_or_create_memory(session_id, db)
 
-    if live_tool:
-        live_data = get_live_data(live_tool, req.user_id, req.message)
-        context_blocks.append(f"[Live cluster data]\n{live_data}")
-        sources.append({"tool": live_tool, "live": True})
-
-    if file_action:
-        file_data = get_file_data(file_action, req.user_id)
-        context_blocks.append(f"[File contents]\n{file_data}")
-        sources.append({"tool": "file_reader", "action": file_action["action"]})
-
-    if context_blocks:
-        llm_message = "\n\n".join(context_blocks) + f"\n\n[User question]\n{req.message}"
-    else:
-        llm_message = req.message
-
-    with _engines_lock:
-        engine = _engines[session_id]
     t0 = time.monotonic()
-    response = engine.chat(llm_message)
-    latency_ms = int((time.monotonic() - t0) * 1000)
-    response_text = str(response)
+    handler  = agent.run(req.message, memory=memory)
+    result   = await handler
+    latency_ms   = int((time.monotonic() - t0) * 1000)
+    response_text = result.response
 
-    # Capture which RAG chunks the engine used for this answer
-    rag_sources = []
-    for node in (getattr(response, "source_nodes", None) or []):
-        meta = (node.node.metadata or {}) if hasattr(node, "node") else {}
-        col  = meta.get("collection")
-        pri  = meta.get("priority")
-        url  = meta.get("source_url")
-        rag_sources.append({
-            "type":        "rag",
-            "label":       _source_label(col, pri, url),
-            "chunk_text":  node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
-            "score":       round(node.score, 4) if node.score is not None else None,
-            "source_file": meta.get("source_file"),
-            "collection":  col,
-        })
-    all_sources = sources + rag_sources
-
-    # Persist to PostgreSQL
-    user    = _get_or_create_user(db, req.user_id)
+    user    = _get_or_create_user(db, username)
     session = _get_or_create_session(db, session_id, user, req.message)
     msg     = _persist_exchange(db, session, req.message, response_text, latency_ms, LLM_MODEL)
-    if all_sources:
-        msg.sources_used = all_sources
+    if source_sink:
+        msg.sources_used = source_sink
+    db.commit()
 
-    return ChatResponse(
-        response=response_text,
-        session_id=session_id,
-        message_id=str(msg.id),
-    )
+    return ChatResponse(response=response_text, session_id=session_id, message_id=str(msg.id))
 
 
 @app.post("/chat/stream")
-def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
-    """SSE streaming version of /chat. Returns text/event-stream with typed JSON events:
-    - {type:'meta', session_id} — sent first, carries the resolved session_id
-    - {type:'token', text}      — one per LLM token as it's generated
-    - {type:'done', message_id, latency_ms} — final event after DB persist
-    - {type:'error', message}   — if something goes wrong mid-stream
-    """
+async def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
+    """SSE streaming. Events: {type:'meta'}, {type:'token'}, {type:'done'}, {type:'error'}"""
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
     if len(req.message) > MAX_MESSAGE_CHARS:
         raise HTTPException(status_code=400, detail=f"Message too long ({len(req.message)} chars). Limit: {MAX_MESSAGE_CHARS}")
+
     session_id = req.session_id or str(uuid.uuid4())
+    username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
+    source_sink: list = []
 
-    with _engines_lock:
-        if session_id not in _engines:
-            # For streaming, open a short-lived DB session to restore memory
-            _db = SessionLocal()
-            try:
-                engine = _new_chat_engine(app.state.index, app.state.llm)
-                _restore_engine_memory(engine, session_id, _db)
-                _engines[session_id] = engine
-            finally:
-                _db.close()
-
-    # Fetch live context before streaming starts (these are fast network calls)
-    live_tool   = needs_live_data(req.message)
-    file_action = needs_file_read(req.message)
-    context_blocks: list[str] = []
-    sources: list[dict] = []
-
-    if live_tool:
-        context_blocks.append(f"[Live cluster data]\n{get_live_data(live_tool, req.user_id, req.message)}")
-        sources.append({"tool": live_tool, "live": True})
-    if file_action:
-        context_blocks.append(f"[File contents]\n{get_file_data(file_action, req.user_id)}")
-        sources.append({"tool": "file_reader", "action": file_action["action"]})
-
-    llm_message = (
-        "\n\n".join(context_blocks) + f"\n\n[User question]\n{req.message}"
-        if context_blocks else req.message
+    # Build agent and restore memory before streaming starts (errors become HTTP errors)
+    tools  = build_tools(username, app.state.retriever, source_sink, _source_label)
+    agent  = ReActAgent(
+        tools=tools,
+        llm=app.state.llm,
+        system_prompt=_load_system_prompt(),
+        streaming=True,
+        verbose=False,
     )
 
-    # Capture the engine reference before entering the generator (LRU-safe snapshot)
-    with _engines_lock:
-        _stream_engine = _engines[session_id]
+    # Memory restore needs a DB session; use a short-lived one before the generator
+    _db = SessionLocal()
+    try:
+        memory = _get_or_create_memory(session_id, _db)
+    finally:
+        _db.close()
 
-    def generate():
+    async def generate():
         yield f"data: {json.dumps({'type': 'meta', 'session_id': session_id})}\n\n"
 
         db = SessionLocal()
         try:
-            user    = _get_or_create_user(db, req.user_id)
+            user    = _get_or_create_user(db, username)
             session = _get_or_create_session(db, session_id, user, req.message)
 
             t0 = time.monotonic()
             full_response = ""
-            stream_response = _stream_engine.stream_chat(llm_message)
 
-            for token in stream_response.response_gen:
-                full_response += token
-                yield f"data: {json.dumps({'type': 'token', 'text': token})}\n\n"
+            handler = agent.run(req.message, memory=memory)
+            async for event in handler.stream_events():
+                if hasattr(event, "delta") and event.delta:
+                    full_response += event.delta
+                    yield f"data: {json.dumps({'type': 'token', 'text': event.delta})}\n\n"
 
-            # Capture RAG source chunks used for this response
-            rag_sources = []
-            for node in (getattr(stream_response, "source_nodes", None) or []):
-                meta = (node.node.metadata or {}) if hasattr(node, "node") else {}
-                col  = meta.get("collection")
-                pri  = meta.get("priority")
-                url  = meta.get("source_url")
-                rag_sources.append({
-                    "type":        "rag",
-                    "label":       _source_label(col, pri, url),
-                    "chunk_text":  node.node.text[:300] if hasattr(node, "node") else str(node)[:300],
-                    "score":       round(node.score, 4) if node.score is not None else None,
-                    "source_file": meta.get("source_file"),
-                    "collection":  col,
-                })
+            result = await handler
+            if not full_response:
+                full_response = result.response
 
             latency_ms = int((time.monotonic() - t0) * 1000)
             msg = _persist_exchange(db, session, req.message, full_response, latency_ms, LLM_MODEL)
-            all_sources = sources + rag_sources
-            if all_sources:
-                msg.sources_used = all_sources
+            if source_sink:
+                msg.sources_used = source_sink
             db.commit()
 
             yield f"data: {json.dumps({'type': 'done', 'message_id': str(msg.id), 'latency_ms': latency_ms})}\n\n"
+
         except Exception as exc:
             db.rollback()
+            logger.exception("Stream error for session %s", session_id)
             yield f"data: {json.dumps({'type': 'error', 'message': str(exc)})}\n\n"
         finally:
             db.close()
@@ -698,11 +566,9 @@ def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
 
 @app.get("/sessions", response_model=List[SessionSummary])
 def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
-    """List all sessions for a user, most recent first."""
     user = db.query(User).filter(User.ldap_uid == user_id).first()
     if not user:
         return []
-
     sessions = (
         db.query(DBSession)
         .filter(DBSession.user_id == user.id, DBSession.is_archived == False)
@@ -710,7 +576,6 @@ def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _auth: di
         .limit(50)
         .all()
     )
-
     result = []
     for s in sessions:
         count = db.query(Message).filter(Message.session_id == s.id).count()
@@ -726,12 +591,10 @@ def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _auth: di
 
 @app.get("/sessions/{session_id}/messages", response_model=List[MessageOut])
 def get_messages(session_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
-    """Return full message history for a session, ordered chronologically."""
     try:
         sid = uuid.UUID(session_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid session_id format")
-
     messages = (
         db.query(Message)
         .filter(Message.session_id == sid)
@@ -752,10 +615,8 @@ def get_messages(session_id: str, db: Session = Depends(get_db), _auth: dict = D
 
 @app.post("/feedback")
 def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
-    """Store a thumbs up (+1) or thumbs down (-1) on an assistant message."""
     if req.rating not in (1, -1):
         raise HTTPException(status_code=400, detail="rating must be +1 or -1")
-
     try:
         mid = uuid.UUID(req.message_id)
     except ValueError:
@@ -766,18 +627,12 @@ def submit_feedback(req: FeedbackRequest, db: Session = Depends(get_db), _auth: 
         raise HTTPException(status_code=404, detail="Message not found")
 
     user = _get_or_create_user(db, req.user_id)
-
     existing = db.query(Feedback).filter(Feedback.message_id == mid).first()
     if existing:
         existing.rating  = req.rating
         existing.comment = req.comment
     else:
-        db.add(Feedback(
-            message_id=mid,
-            user_id=user.id,
-            rating=req.rating,
-            comment=req.comment,
-        ))
+        db.add(Feedback(message_id=mid, user_id=user.id, rating=req.rating, comment=req.comment))
 
     return {"status": "ok", "message_id": req.message_id, "rating": req.rating}
 
@@ -805,6 +660,9 @@ def ingest(
     nodes = _parse_into_nodes(docs, file.filename, collection)
     app.state.index.insert_nodes(nodes)
 
+    # Rebuild retriever so new docs are immediately searchable via BM25
+    app.state.retriever = _build_hybrid_retriever(app.state.index)
+
     user = _get_or_create_user(db, user_id)
     doc_record = KnowledgeDoc(
         filename=file.filename,
@@ -817,19 +675,13 @@ def ingest(
     db.add(doc_record)
     db.flush()
 
-    return IngestResponse(
-        status="ok",
-        chunks_added=len(nodes),
-        filename=file.filename,
-        doc_id=str(doc_record.id),
-    )
+    return IngestResponse(status="ok", chunks_added=len(nodes), filename=file.filename, doc_id=str(doc_record.id))
 
 
 @app.delete("/session/{session_id}")
 def clear_session(session_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
-    """Clear the in-memory LlamaIndex engine and archive the session in the DB."""
-    with _engines_lock:
-        _engines.pop(session_id, None)
+    with _memories_lock:
+        _memories.pop(session_id, None)
 
     try:
         sid = uuid.UUID(session_id)
@@ -856,9 +708,9 @@ def auth_login(req: LoginRequest):
     if not expected or expected != req.password:
         raise HTTPException(status_code=401, detail="Invalid credentials")
     payload = {
-        "sub": req.username,
+        "sub":  req.username,
         "role": "admin" if req.username == "admin" else "user",
-        "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_H),
+        "exp":  datetime.utcnow() + timedelta(hours=JWT_EXPIRE_H),
     }
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token_type": "bearer", "username": req.username, "role": payload["role"]}
@@ -903,6 +755,9 @@ def ingest_url(req: IngestUrlRequest, db: Session = Depends(get_db), _auth: dict
     nodes    = _parse_into_nodes(docs, filename, req.collection)
     app.state.index.insert_nodes(nodes)
 
+    # Rebuild retriever after ingest so BM25 includes new nodes
+    app.state.retriever = _build_hybrid_retriever(app.state.index)
+
     user_id = _auth["username"] if _auth["username"] != "api" else req.user_id
     user    = _get_or_create_user(db, user_id)
     doc_record = KnowledgeDoc(
@@ -916,12 +771,7 @@ def ingest_url(req: IngestUrlRequest, db: Session = Depends(get_db), _auth: dict
     db.add(doc_record)
     db.flush()
 
-    return IngestResponse(
-        status="ok",
-        chunks_added=len(nodes),
-        filename=filename,
-        doc_id=str(doc_record.id),
-    )
+    return IngestResponse(status="ok", chunks_added=len(nodes), filename=filename, doc_id=str(doc_record.id))
 
 
 # ── Admin endpoints ────────────────────────────────────────────────────────
@@ -954,11 +804,7 @@ def admin_list_docs(
 
 
 @app.delete("/admin/docs/{doc_id}")
-def admin_delete_doc(
-    doc_id: str,
-    db: Session = Depends(get_db),
-    _auth: dict = Depends(require_auth),
-):
+def admin_delete_doc(doc_id: str, db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
     try:
         did = uuid.UUID(doc_id)
     except ValueError:

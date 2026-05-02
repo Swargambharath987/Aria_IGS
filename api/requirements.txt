@@ -5,7 +5,6 @@ python-multipart==0.0.9
 # LlamaIndex + RAG
 chromadb==1.5.7
 llama-index-core==0.14.20
-llama-index-llms-ollama==0.10.1
 llama-index-llms-openai-like==0.3.4
 llama-index-embeddings-ollama==0.9.0
 llama-index-vector-stores-chroma==0.5.5
@@ -27,5 +26,5 @@ beautifulsoup4==4.12.3
 # SSH tools (Slurm live data)
 paramiko==3.5.1
 
-# LRU cache for engine store
+# LRU cache for session memory store
 cachetools==5.3.3
