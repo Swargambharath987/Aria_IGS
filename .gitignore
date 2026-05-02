@@ -1,6 +1,9 @@
 # Personal docs — local only, never pushed
 my_docs/
 
+# System prompt — internal, not public
+prompts/
+
 # Python
 __pycache__/
 *.py[cod]
