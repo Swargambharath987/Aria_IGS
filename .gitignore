@@ -52,6 +52,9 @@ tmp/
 *.swp
 *.swo
 
+# Evaluation sets — internal, not public
+eval/
+
 # Node
 node_modules/
 frontend/dist/
