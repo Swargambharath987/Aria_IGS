@@ -30,6 +30,7 @@ data/raw/
 data/chroma_db/
 
 # Archives
+archive/
 *.tar
 *.tar.gz
 *.zip
