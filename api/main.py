@@ -33,7 +33,7 @@ from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
 from llama_index.core.schema import NodeWithScore, QueryBundle
 from llama_index.core.tools import FunctionTool
 from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.openai_like import OpenAILike
+from llama_index.llms.openai import OpenAI
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -155,19 +155,18 @@ def _load_system_prompt() -> str:
     )
 
 
-def _build_llm() -> OpenAILike:
-    """Single LLM factory — OpenAI-compatible endpoint, backend-agnostic."""
-    return OpenAILike(
+def _build_llm() -> OpenAI:
+    """Single LLM factory — OpenAI-compatible endpoint (Ollama /v1 or vLLM)."""
+    return OpenAI(
         model=LLM_MODEL,
         api_base=LLM_BASE_URL,
         api_key=LLM_API_KEY,
         request_timeout=120.0,
-        is_chat_model=True,
         context_window=LLM_CONTEXT_WINDOW,
     )
 
 
-def _build_rag_index(llm: OpenAILike):
+def _build_rag_index(llm: OpenAI):
     embed = OllamaEmbedding(model_name=EMBED_MODEL, base_url=OLLAMA_HOST)
     Settings.llm         = llm
     Settings.embed_model = embed
