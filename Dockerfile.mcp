@@ -7,10 +7,8 @@ WORKDIR /app
 COPY mcp_server/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-# Share the SSH tool implementations from the API
-COPY api/tools/ /app/tools/
 COPY mcp_server/ /app/
 
 EXPOSE 8001
 
-CMD ["python", "server.py"]
+CMD ["python", "-m", "mcp_server"]
