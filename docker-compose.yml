@@ -82,5 +82,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  slurm-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: aria-mcp
+    ports:
+      - "8001:8001"
+    environment:
+      - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
+      - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
+      - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}
+      - SLURM_SSH_TIMEOUT=15
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/sse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   postgres_data:

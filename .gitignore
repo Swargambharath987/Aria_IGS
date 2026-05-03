@@ -26,6 +26,7 @@ env/
 # Environment variables / secrets
 .env
 .env.*
+!.env.example
 *.env
 
 # Data & vector DBs (large binary / generated files)
