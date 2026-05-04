@@ -90,11 +90,15 @@ services:
     ports:
       - "8001:8001"
     environment:
-      - SLURM_API_URL=${SLURM_API_URL:-http://localhost:6820}
-      - SLURM_API_VERSION=${SLURM_API_VERSION:-v0.0.41}
+      # SSH access to the IGS login node (same key used by aria-backend)
+      - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
+      - SLURM_SSH_KEY_PATH=/run/secrets/slurm_key
+      - SLURM_SSH_USER=${SLURM_SSH_DEFAULT_USER:-aria_service}
+      - SLURM_SSH_TIMEOUT=15
+      # JWT key for validating per-user tokens (base64-encoded jwt_hs256.key)
       - SLURM_JWT_KEY=${SLURM_JWT_KEY:-}
-      - SLURM_VERIFY_SSL=${SLURM_VERIFY_SSL:-true}
-      - SLURM_TIMEOUT=30
+    secrets:
+      - slurm_key
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/sse"]
       interval: 10s
@@ -105,3 +109,7 @@ services:
 
 volumes:
   postgres_data:
+
+secrets:
+  slurm_key:
+    file: ${SLURM_SSH_KEY_PATH:-/dev/null}

@@ -2,11 +2,10 @@
 MCP Resources — static reference data and live cluster info.
 Resources are read by the LLM at context-building time, not on-demand like tools.
 """
-import asyncio
-
 from fastmcp import FastMCP
 
-from client import SlurmClient
+from config import settings
+from ssh import run
 
 
 def register_resources(app: FastMCP):
@@ -146,49 +145,25 @@ srun --pty --partition=defq --cpus-per-task=4 --mem=16G bash
 """
 
     @app.resource("slurm://cluster/nodes")
-    async def get_cluster_nodes(slurm_token: str = "", slurm_user: str = "") -> str:
-        """Live node status from the IGS cluster."""
-        if not slurm_token or not slurm_user:
-            return "[Authentication required — provide your Slurm JWT token]"
-        try:
-            client = SlurmClient(slurm_user, slurm_token)
-            data   = await client.get("/nodes")
-            nodes  = data.get("nodes", [])
-            if not nodes:
-                return "No node data available."
-            rows = ["| Node | State | CPUs | Memory | Partitions |",
-                    "|------|-------|------|--------|------------|"]
-            for n in nodes:
-                rows.append(
-                    f"| {n.get('name','')} "
-                    f"| {n.get('state',[''])[0]} "
-                    f"| {n.get('cpus','')} "
-                    f"| {n.get('real_memory','')}M "
-                    f"| {', '.join(n.get('partitions', []))} |"
-                )
-            return "\n".join(rows)
-        except Exception as e:
-            return f"[Error fetching nodes: {e}]"
+    def get_cluster_nodes() -> str:
+        """Live node status from the IGS cluster via SSH."""
+        if not settings.slurm_ssh_host:
+            return "[SSH not configured — SLURM_SSH_HOST not set]"
+        out = run(
+            settings.slurm_ssh_user,
+            "module load slurm 2>/dev/null; "
+            "sinfo --Node --format='%.20N %.5c %.8m %.10T %.20P'",
+        )
+        return f"# IGS Cluster Nodes\n\n```\n{out}\n```"
 
     @app.resource("slurm://cluster/partitions")
-    async def get_cluster_partitions(slurm_token: str = "", slurm_user: str = "") -> str:
-        """Live partition info from the IGS cluster."""
-        if not slurm_token or not slurm_user:
-            return "[Authentication required — provide your Slurm JWT token]"
-        try:
-            client = SlurmClient(slurm_user, slurm_token)
-            data   = await client.get("/partitions")
-            parts  = data.get("partitions", [])
-            rows   = ["| Partition | State | Nodes | Max time | Default mem |",
-                      "|-----------|-------|-------|----------|-------------|"]
-            for p in parts:
-                rows.append(
-                    f"| {p.get('name','')} "
-                    f"| {p.get('state','')} "
-                    f"| {p.get('nodes', {}).get('total','')} "
-                    f"| {p.get('maximum_time', {}).get('number','')} min "
-                    f"| {p.get('defaults', {}).get('memory_per_node', {}).get('number','')}M |"
-                )
-            return "\n".join(rows)
-        except Exception as e:
-            return f"[Error fetching partitions: {e}]"
+    def get_cluster_partitions() -> str:
+        """Live partition info from the IGS cluster via SSH."""
+        if not settings.slurm_ssh_host:
+            return "[SSH not configured — SLURM_SSH_HOST not set]"
+        out = run(
+            settings.slurm_ssh_user,
+            "module load slurm 2>/dev/null; "
+            "sinfo --format='%.15P %.5a %.10l %.6D %.6t'",
+        )
+        return f"# IGS Cluster Partitions\n\n```\n{out}\n```"

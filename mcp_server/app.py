@@ -8,9 +8,10 @@ app = FastMCP(
     name="slurm-igs",
     instructions=(
         "MCP server for the IGS HPC cluster at University of Maryland. "
-        "Provides full Slurm job management: submit, cancel, monitor, and cluster status. "
-        "Each call requires a valid Slurm JWT — generate one on the cluster with: "
-        "`scontrol token lifespan=3600`"
+        "Provides Slurm job management via SSH: list jobs, view details, check efficiency, "
+        "get cluster status, and (with admin approval) submit and cancel jobs. "
+        "Authenticate by passing your Slurm JWT as a Bearer token — generate one on the "
+        "cluster with: scontrol token lifespan=3600"
     ),
 )
 

@@ -2,24 +2,21 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
-class JobSpec(BaseModel):
-    name:                      Optional[str]       = Field(None, max_length=64, pattern=r"^[a-zA-Z0-9_\-]*$")
-    nodes:                     Optional[str]       = None   # e.g. "1" or "1-4"
-    current_working_directory: str                 = "/tmp"
-    partition:                 Optional[str]       = Field(None, max_length=32)
-    environment:               List[str]           = ["PATH=/bin:/usr/bin:/usr/local/bin:."]
-    tres_per_job:              Optional[str]       = None   # e.g. "gres/gpu=1,mem=30G"
-    standard_output:           Optional[str]       = None
-    standard_error:            Optional[str]       = None
-    account:                   Optional[str]       = Field(None, max_length=32)
-    time_limit:                Optional[int]       = Field(None, ge=1, le=10080)  # minutes, max 1 week
-    memory_per_node:           Optional[str]       = None   # e.g. "8G", "1024M"
-    cpus_per_task:             Optional[int]       = Field(None, ge=1, le=128)
-
-
 class JobSubmissionRequest(BaseModel):
-    job:    JobSpec
-    script: str   # full bash script content
+    """
+    Represents a job to submit via sbatch.
+    The script must be a complete bash script (including #!/bin/bash and #SBATCH directives).
+    Extra SBATCH directives can be added via sbatch_args (these override anything in the script).
+    """
+    script:      str            # full bash script content including #SBATCH headers
+    job_name:    Optional[str]  = Field(None, max_length=64, pattern=r"^[a-zA-Z0-9_\-]*$")
+    partition:   Optional[str]  = Field(None, max_length=32)
+    account:     Optional[str]  = Field(None, max_length=32)
+    # These override #SBATCH directives already in the script
+    mem:         Optional[str]  = None   # e.g. "8G", "1024M"
+    cpus:        Optional[int]  = Field(None, ge=1, le=128)
+    time_limit:  Optional[str]  = None   # e.g. "24:00:00"
+    gpus:        Optional[int]  = Field(None, ge=0, le=8)
 
 
 class JobListFilters(BaseModel):

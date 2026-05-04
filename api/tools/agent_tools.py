@@ -173,6 +173,27 @@ def build_tools(
         source_sink.append({"type": "tool", "label": f"Directory: {directory}", "tool": "list_user_files"})
         return list_job_files(username, directory)
 
+    # ── Resource estimator ───────────────────────────────────────────────────
+
+    def estimate_job_resources(script_content: str) -> str:
+        """
+        Analyze a job script and recommend Slurm resource allocations.
+
+        Use this when the user:
+        - Pastes or shares a job script and asks how much memory/CPU to request
+        - Asks "what sbatch flags should I use for this script?"
+        - Wants to know which partition to use for their workload
+        - Asks for help writing the #SBATCH header for their job
+        - Asks how many CPUs or how much memory a specific bioinformatics tool needs
+
+        Input: the full text content of the script (bash, Python, R, or workflow file).
+        Returns: recommended resources + a ready-to-paste #SBATCH header block.
+        """
+        from tools.resource_estimator import estimate
+        result = estimate(script_content)
+        source_sink.append({"type": "tool", "label": "Resource Estimator", "tool": "estimate_job_resources"})
+        return result
+
     return [
         FunctionTool.from_defaults(fn=search_knowledge_base),
         FunctionTool.from_defaults(fn=get_job_status),
@@ -181,4 +202,5 @@ def build_tools(
         FunctionTool.from_defaults(fn=get_cluster_status),
         FunctionTool.from_defaults(fn=read_user_file),
         FunctionTool.from_defaults(fn=list_user_files),
+        FunctionTool.from_defaults(fn=estimate_job_resources),
     ]
