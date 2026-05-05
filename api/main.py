@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -42,7 +43,8 @@ logger = logging.getLogger(__name__)
 
 from db.models import Base, Feedback, KnowledgeDoc, Message, MessageRole, Session as DBSession, User, UserRole
 from db.session import SessionLocal, engine, get_db
-from tools.agent_tools import build_tools
+from tools.agent_tools import build_tools, _pending_actions, _expire_pending_actions
+from tools.slurm_ssh import _run as ssh_run
 
 # ── Config ─────────────────────────────────────────────────────────────────
 CHROMA_DIR  = Path(os.environ.get("CHROMA_DIR",  "/app/data/chroma_db"))
@@ -543,12 +545,32 @@ async def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
                 full_response = result.response
 
             latency_ms = int((time.monotonic() - t0) * 1000)
+
+            # Extract pending action marker before persisting
+            pending_action = None
+            _pa_match = re.search(r"ARIA_PENDING_ACTION:(\{[^\n]+\})", full_response)
+            if _pa_match:
+                try:
+                    pending_action = json.loads(_pa_match.group(1))
+                    # Strip the marker line from the stored response
+                    full_response = full_response[:_pa_match.start()].rstrip()
+                except (json.JSONDecodeError, Exception):
+                    pending_action = None
+
             msg = _persist_exchange(db, session, req.message, full_response, latency_ms, LLM_MODEL)
             if source_sink:
                 msg.sources_used = source_sink
             db.commit()
 
-            yield f"data: {json.dumps({'type': 'done', 'message_id': str(msg.id), 'latency_ms': latency_ms})}\n\n"
+            done_payload: dict = {
+                "type":       "done",
+                "message_id": str(msg.id),
+                "latency_ms": latency_ms,
+                "sources":    source_sink,
+            }
+            if pending_action:
+                done_payload["pending_action"] = pending_action
+            yield f"data: {json.dumps(done_payload)}\n\n"
 
         except Exception as exc:
             db.rollback()
@@ -562,6 +584,40 @@ async def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Action confirm endpoint ────────────────────────────────────────────────
+
+class ConfirmActionRequest(BaseModel):
+    action_id: str
+    decision:  str  # "approve" | "deny"
+
+
+@app.post("/actions/confirm")
+def confirm_action(req: ConfirmActionRequest, _auth: dict = Depends(require_auth)):
+    """
+    Confirm or deny a pending destructive Slurm action (sbatch / scancel).
+    On approve: executes the stored SSH command and returns the output.
+    On deny:    discards the pending action.
+    """
+    if req.decision not in ("approve", "deny"):
+        raise HTTPException(status_code=400, detail="decision must be 'approve' or 'deny'")
+
+    _expire_pending_actions()
+
+    action = _pending_actions.get(req.action_id)
+    if not action:
+        raise HTTPException(status_code=404, detail="Action not found or expired")
+
+    # Remove from store regardless of decision
+    _pending_actions.pop(req.action_id, None)
+
+    if req.decision == "deny":
+        return {"status": "cancelled", "action_id": req.action_id}
+
+    # Approve — execute the SSH command
+    result = ssh_run(action["username"], action["command"])
+    return {"status": "executed", "result": result, "action_id": req.action_id}
 
 
 @app.get("/sessions", response_model=List[SessionSummary])

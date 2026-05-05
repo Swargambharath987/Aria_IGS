@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown';
 import {
   fetchSessions, fetchMessages, submitFeedback, streamMessage,
   fetchAdminStats, fetchAdminDocs, deleteAdminDoc, ingestUrl,
-  fetchMe, deleteSession,
+  fetchMe, deleteSession, confirmAction,
 } from './api.js';
 import LoginPage from './Login.jsx';
 import './App.css';
@@ -155,7 +155,7 @@ function AdminPanel({ userId }) {
 
 // ── Message bubble ─────────────────────────────────────────────────────────
 
-function MessageBubble({ msg, ratings, onRate }) {
+function MessageBubble({ msg, ratings, onRate, onConfirmAction }) {
   const isUser    = msg.role === 'user';
   const latency   = msg.latency_ms != null ? (msg.latency_ms / 1000).toFixed(2) : null;
   const rated     = ratings[msg.message_id];
@@ -176,6 +176,48 @@ function MessageBubble({ msg, ratings, onRate }) {
             {latency && <span className="latency">{latency}s</span>}
             <button className={`feedback-btn ${rated === 1 ? 'active-up' : ''}`} title="Helpful" onClick={() => onRate(msg.message_id, 1)}>👍</button>
             <button className={`feedback-btn ${rated === -1 ? 'active-down' : ''}`} title="Not helpful" onClick={() => onRate(msg.message_id, -1)}>👎</button>
+          </div>
+        )}
+        {!isUser && !msg.streaming && msg.sources?.length > 0 && (
+          <div className="msg-sources">
+            <span className="sources-label">Sources:</span>
+            {[...new Map(msg.sources.map(s => [s.label, s])).values()].map((s, i) => (
+              <span key={i} className={`source-tag source-tag--${s.type}`}>{s.label}</span>
+            ))}
+          </div>
+        )}
+        {!isUser && !msg.streaming && msg.pending_action && (
+          <div className="action-approval-card">
+            <div className="action-summary">
+              <span className="action-icon">⚠</span>
+              <span>{msg.pending_action.summary}</span>
+            </div>
+            <div className="action-buttons">
+              <button
+                className="approve-btn"
+                onClick={() => onConfirmAction(msg.pending_action.action_id, 'approve')}
+              >
+                Approve
+              </button>
+              <button
+                className="deny-btn"
+                onClick={() => onConfirmAction(msg.pending_action.action_id, 'deny')}
+              >
+                Deny
+              </button>
+            </div>
+          </div>
+        )}
+        {!isUser && !msg.streaming && msg.action_result && (
+          <div className={`action-result action-result--${msg.action_result.decision}`}>
+            {msg.action_result.decision === 'approve' ? (
+              <>
+                <span>&#x2713; Executed: </span>
+                <span>{msg.action_result.result}</span>
+              </>
+            ) : (
+              <span>&#x2717; Cancelled</span>
+            )}
           </div>
         )}
       </div>
@@ -287,7 +329,14 @@ export default function App() {
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           if (last.message_id !== streamingIdRef.current) return prev;
-          return [...prev.slice(0, -1), { ...last, message_id: data.message_id, latency_ms: data.latency_ms, streaming: false }];
+          return [...prev.slice(0, -1), {
+            ...last,
+            message_id:     data.message_id,
+            latency_ms:     data.latency_ms,
+            sources:        data.sources,
+            pending_action: data.pending_action || null,
+            streaming:      false,
+          }];
         });
         setLoading(false);
         loadSessions();
@@ -301,6 +350,39 @@ export default function App() {
         setLoading(false);
       },
     });
+  }
+
+  async function handleConfirmAction(actionId, decision) {
+    try {
+      const res = await confirmAction(actionId, decision);
+      setMessages((prev) =>
+        prev.map((msg) => {
+          if (msg.pending_action?.action_id !== actionId) return msg;
+          return {
+            ...msg,
+            pending_action: null,
+            action_result: {
+              decision,
+              result: res.result || null,
+            },
+          };
+        })
+      );
+    } catch (err) {
+      setMessages((prev) =>
+        prev.map((msg) => {
+          if (msg.pending_action?.action_id !== actionId) return msg;
+          return {
+            ...msg,
+            pending_action: null,
+            action_result: {
+              decision,
+              result: `Error: ${err.message}`,
+            },
+          };
+        })
+      );
+    }
   }
 
   function handleKeyDown(e) {
@@ -374,7 +456,7 @@ export default function App() {
             </div>
           )}
           {messages.map((msg) => (
-            <MessageBubble key={msg.message_id} msg={msg} ratings={ratings} onRate={handleRate} />
+            <MessageBubble key={msg.message_id} msg={msg} ratings={ratings} onRate={handleRate} onConfirmAction={handleConfirmAction} />
           ))}
           <div ref={bottomRef} />
         </div>

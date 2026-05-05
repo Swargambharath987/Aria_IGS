@@ -109,13 +109,34 @@ export function streamMessage(message, sessionId, userId, { onMeta, onToken, onD
             const data = JSON.parse(line.slice(6));
             if (data.type === 'meta')  onMeta?.(data);
             if (data.type === 'token') onToken?.(data.text);
-            if (data.type === 'done')  onDone?.(data);
+            if (data.type === 'done')  onDone?.({ message_id: data.message_id, latency_ms: data.latency_ms, sources: data.sources || [], pending_action: data.pending_action || null });
             if (data.type === 'error') onError?.(new Error(data.message));
           } catch { /* malformed SSE line — skip */ }
         }
       }
     })
     .catch((err) => onError?.(err));
+}
+
+// ── Action confirm ────────────────────────────────────────────────────────
+
+/**
+ * Confirm or deny a pending Slurm action.
+ * @param {string} actionId - UUID of the pending action
+ * @param {'approve'|'deny'} decision
+ * @returns {Promise<{status: string, result?: string, action_id: string}>}
+ */
+export async function confirmAction(actionId, decision) {
+  const res = await fetch(`${BASE_URL}/actions/confirm`, {
+    method: 'POST',
+    headers: headers(),
+    body: JSON.stringify({ action_id: actionId, decision }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || res.statusText);
+  }
+  return await res.json();
 }
 
 // ── Admin ─────────────────────────────────────────────────────────────────

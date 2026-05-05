@@ -8,6 +8,9 @@ agent never needs to ask the user for credentials.
 source_sink is a list shared with the calling endpoint — tool functions append
 source metadata to it as they run so the endpoint can persist it to sources_used.
 """
+import json
+import uuid
+from datetime import datetime, timedelta
 from typing import Callable, List
 
 from llama_index.core.tools import FunctionTool
@@ -20,6 +23,23 @@ from tools.slurm_ssh import (
     job_status,
 )
 from tools.file_reader import list_job_files, read_file
+
+# ── Pending actions store ─────────────────────────────────────────────────────
+# Keyed by action_id (str UUID). Each value is a dict:
+#   { type, details, command, username, created_at }
+# Entries older than 10 minutes are expired on lookup/insert.
+
+_pending_actions: dict[str, dict] = {}
+
+_PENDING_ACTION_TTL = timedelta(minutes=10)
+
+
+def _expire_pending_actions() -> None:
+    """Remove entries older than 10 minutes."""
+    cutoff = datetime.utcnow() - _PENDING_ACTION_TTL
+    expired = [aid for aid, entry in _pending_actions.items() if entry["created_at"] < cutoff]
+    for aid in expired:
+        _pending_actions.pop(aid, None)
 
 
 def build_tools(
@@ -173,6 +193,105 @@ def build_tools(
         source_sink.append({"type": "tool", "label": f"Directory: {directory}", "tool": "list_user_files"})
         return list_job_files(username, directory)
 
+    # ── Write tools (require approval) ──────────────────────────────────────
+
+    def request_job_submission(
+        script_content: str,
+        job_name: str = "my_job",
+        partition: str = "shared",
+        mem: str = "4G",
+        cpus: int = 1,
+    ) -> str:
+        """
+        Use this when the user explicitly asks to SUBMIT a job script to the
+        Slurm cluster via sbatch.
+
+        Do NOT use this for questions about how to submit a job, resource
+        estimates, or any read-only operation. Only use it when the user
+        clearly says they want to run / submit / execute a job script right now.
+
+        Parameters:
+            script_content — the full text of the job script to submit
+            job_name       — job name (default: my_job)
+            partition      — Slurm partition to use (default: shared)
+            mem            — memory request, e.g. 4G, 16G (default: 4G)
+            cpus           — number of CPUs to request (default: 1)
+
+        Returns a pending-action marker that the UI will display as an
+        Approve / Deny card. The job is NOT submitted until the user approves.
+        """
+        if not SSH_AVAILABLE:
+            return "[SSH not configured — job submission unavailable. Set SLURM_SSH_HOST to enable.]"
+
+        _expire_pending_actions()
+
+        action_id = str(uuid.uuid4())
+        # Escape single quotes in script content for safe shell injection
+        safe_script = script_content.replace("'", "'\\''")
+        command = (
+            f"echo '{safe_script}' | sbatch "
+            f"--job-name={job_name} "
+            f"--partition={partition} "
+            f"--mem={mem} "
+            f"--cpus-per-task={cpus}"
+        )
+        summary = (
+            f"Submit job: {job_name}, partition: {partition}, "
+            f"mem: {mem}, cpus: {cpus}"
+        )
+        _pending_actions[action_id] = {
+            "type":       "sbatch",
+            "details":    {"job_name": job_name, "partition": partition, "mem": mem, "cpus": cpus},
+            "command":    command,
+            "username":   username,
+            "created_at": datetime.utcnow(),
+        }
+        source_sink.append({"type": "tool", "label": "Job Submission Request", "tool": "request_job_submission"})
+        marker = json.dumps({"action_id": action_id, "type": "sbatch", "summary": summary})
+        return (
+            f"I've prepared your job submission. Please review the details and approve or deny below.\n\n"
+            f"**Job:** {job_name}  |  **Partition:** {partition}  |  **Memory:** {mem}  |  **CPUs:** {cpus}\n\n"
+            f"ARIA_PENDING_ACTION:{marker}"
+        )
+
+    def request_job_cancellation(job_id: str) -> str:
+        """
+        Use this when the user explicitly asks to CANCEL a specific job by its
+        numeric Slurm job ID (e.g. "cancel job 12345", "scancel 12345").
+
+        Do NOT use this for checking job status, listing jobs, or any read
+        operation. Only use it when the user clearly wants to cancel / kill /
+        stop a specific running or pending job right now.
+
+        Parameters:
+            job_id — the numeric Slurm job ID to cancel
+
+        Returns a pending-action marker that the UI will display as an
+        Approve / Deny card. The job is NOT cancelled until the user approves.
+        """
+        if not SSH_AVAILABLE:
+            return "[SSH not configured — job cancellation unavailable. Set SLURM_SSH_HOST to enable.]"
+
+        _expire_pending_actions()
+
+        action_id = str(uuid.uuid4())
+        command = f"scancel --user={username} {job_id}"
+        summary = f"Cancel job ID {job_id}"
+        _pending_actions[action_id] = {
+            "type":       "scancel",
+            "details":    {"job_id": job_id},
+            "command":    command,
+            "username":   username,
+            "created_at": datetime.utcnow(),
+        }
+        source_sink.append({"type": "tool", "label": f"Job Cancellation Request (job {job_id})", "tool": "request_job_cancellation"})
+        marker = json.dumps({"action_id": action_id, "type": "scancel", "summary": summary})
+        return (
+            f"I've prepared the cancellation request for job **{job_id}**. "
+            f"Please approve or deny below.\n\n"
+            f"ARIA_PENDING_ACTION:{marker}"
+        )
+
     # ── Resource estimator ───────────────────────────────────────────────────
 
     def estimate_job_resources(script_content: str) -> str:
@@ -203,4 +322,6 @@ def build_tools(
         FunctionTool.from_defaults(fn=read_user_file),
         FunctionTool.from_defaults(fn=list_user_files),
         FunctionTool.from_defaults(fn=estimate_job_resources),
+        FunctionTool.from_defaults(fn=request_job_submission),
+        FunctionTool.from_defaults(fn=request_job_cancellation),
     ]
