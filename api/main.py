@@ -147,14 +147,33 @@ def _persist_exchange(
 
 # ── LlamaIndex setup ───────────────────────────────────────────────────────
 
-def _load_system_prompt() -> str:
-    if PROMPT_PATH.exists():
-        return PROMPT_PATH.read_text().strip()
-    return (
-        "You are Aria, the IGS research computing assistant. "
-        "Help researchers with their Slurm jobs, bioinformatics workflows, "
-        "cluster usage, and coding. Be concise, precise, and always cite your sources."
+def _load_system_prompt(
+    user_display_name: str = "",
+    user_lab: str = "",
+    user_preferences: "dict | None" = None,
+) -> str:
+    base = (
+        PROMPT_PATH.read_text().strip()
+        if PROMPT_PATH.exists()
+        else (
+            "You are Aria, the IGS research computing assistant. "
+            "Help researchers with their Slurm jobs, bioinformatics workflows, "
+            "cluster usage, and coding. Be concise, precise, and always cite your sources."
+        )
     )
+    prefs_str = (
+        ", ".join(f"{k}={v}" for k, v in user_preferences.items())
+        if user_preferences
+        else "none stored"
+    )
+    user_block = (
+        f"[USER CONTEXT]\n"
+        f"Name: {user_display_name}\n"
+        f"Lab: {user_lab or 'unknown — ask if relevant to the query'}\n"
+        f"Preferences: {prefs_str}\n"
+        f"[END USER CONTEXT]\n\n"
+    )
+    return user_block + base
 
 
 def _build_llm() -> OpenAILike:
@@ -465,15 +484,25 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = De
     session_id = req.session_id or str(uuid.uuid4())
     username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
 
-    # Source sink — tool closures append to this list as they execute
-    source_sink: list = []
+    # Load user profile before building tools so context can be injected
+    user = _get_or_create_user(db, username)
 
-    # Build agent fresh per request (stateless; only memory is cached)
-    tools  = build_tools(username, app.state.retriever, source_sink, _source_label)
+    source_sink: list = []
+    tools  = build_tools(
+        username, app.state.retriever, source_sink, _source_label,
+        user_display_name=user.display_name or username,
+        user_lab=user.lab or "",
+        user_preferences=user.preferences or {},
+        user_db_id=user.id,
+    )
     agent  = ReActAgent(
         tools=tools,
         llm=app.state.llm,
-        system_prompt=_load_system_prompt(),
+        system_prompt=_load_system_prompt(
+            user_display_name=user.display_name or username,
+            user_lab=user.lab or "",
+            user_preferences=user.preferences or {},
+        ),
         verbose=False,
     )
     memory = _get_or_create_memory(session_id, db)
@@ -484,7 +513,6 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = De
     latency_ms   = int((time.monotonic() - t0) * 1000)
     response_text = result.response
 
-    user    = _get_or_create_user(db, username)
     session = _get_or_create_session(db, session_id, user, req.message)
     msg     = _persist_exchange(db, session, req.message, response_text, latency_ms, LLM_MODEL)
     if source_sink:
@@ -506,29 +534,43 @@ async def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
     username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
     source_sink: list = []
 
-    # Build agent and restore memory before streaming starts (errors become HTTP errors)
-    tools  = build_tools(username, app.state.retriever, source_sink, _source_label)
+    # Fetch user profile and restore memory before the generator starts
+    _db = SessionLocal()
+    try:
+        _user = _get_or_create_user(_db, username)
+        _u_name  = _user.display_name or username
+        _u_lab   = _user.lab or ""
+        _u_prefs = dict(_user.preferences or {})
+        _u_id    = _user.id
+        memory   = _get_or_create_memory(session_id, _db)
+    finally:
+        _db.close()
+
+    tools  = build_tools(
+        username, app.state.retriever, source_sink, _source_label,
+        user_display_name=_u_name,
+        user_lab=_u_lab,
+        user_preferences=_u_prefs,
+        user_db_id=_u_id,
+    )
     agent  = ReActAgent(
         tools=tools,
         llm=app.state.llm,
-        system_prompt=_load_system_prompt(),
+        system_prompt=_load_system_prompt(
+            user_display_name=_u_name,
+            user_lab=_u_lab,
+            user_preferences=_u_prefs,
+        ),
         streaming=True,
         verbose=False,
     )
-
-    # Memory restore needs a DB session; use a short-lived one before the generator
-    _db = SessionLocal()
-    try:
-        memory = _get_or_create_memory(session_id, _db)
-    finally:
-        _db.close()
 
     async def generate():
         yield f"data: {json.dumps({'type': 'meta', 'session_id': session_id})}\n\n"
 
         db = SessionLocal()
         try:
-            user    = _get_or_create_user(db, username)
+            user    = _get_or_create_user(db, username)  # fresh instance for this transaction
             session = _get_or_create_session(db, session_id, user, req.message)
 
             t0 = time.monotonic()
