@@ -28,3 +28,6 @@ paramiko==3.5.1
 
 # LRU cache for session memory store
 cachetools==5.3.3
+
+# LDAP — user identity lookup against IGS directory
+ldap3==2.9.1

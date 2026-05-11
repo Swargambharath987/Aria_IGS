@@ -66,17 +66,15 @@ LLM_CONTEXT_WINDOW = int(os.environ.get("LLM_CONTEXT_WINDOW", "32768"))
 _raw_tokens  = os.environ.get("API_TOKENS", "igs-dev-token")
 VALID_TOKENS = {t.strip() for t in _raw_tokens.split(",") if t.strip()}
 
-# JWT config — demo stub until LDAP/AD is wired (Phase 3)
+# JWT config
 JWT_SECRET    = os.environ.get("JWT_SECRET", "aria-dev-secret-change-in-prod")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_H  = 24
 
-# Demo users: "admin:pass,user1:pass1" — replaced by LDAP once IT provides AD
-DEMO_USERS: dict[str, str] = {}
-for _entry in os.environ.get("DEMO_USERS", "admin:aria_demo").split(","):
-    if ":" in _entry:
-        _u, _p = _entry.strip().split(":", 1)
-        DEMO_USERS[_u] = _p
+# LDAP — IGS directory for username verification (anonymous search, no password)
+LDAP_HOST       = os.environ.get("LDAP_HOST",       "ldap://ldap.igs.umaryland.edu")
+LDAP_PEOPLE_OU  = os.environ.get("LDAP_PEOPLE_OU",  "ou=People,dc=igs,dc=umaryland,dc=edu")
+
 
 # Per-session conversation memory (ChatMemoryBuffer objects), capped at 50.
 # The agent itself is stateless and rebuilt per request; only memory is cached.
@@ -85,6 +83,25 @@ _memories_lock: threading.Lock = threading.Lock()
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
+
+def _ldap_lookup(username: str) -> "dict | None":
+    """
+    Anonymous LDAP search to verify a username exists in the IGS directory.
+    Returns {'display_name', 'email'} if found, None if username does not exist.
+    Raises an exception if the LDAP server is unreachable (caller handles this as 503).
+    """
+    from ldap3 import ALL, ANONYMOUS, Connection, Server
+    server = Server(LDAP_HOST, get_info=ALL, connect_timeout=5)
+    conn   = Connection(server, authentication=ANONYMOUS, auto_bind=True, receive_timeout=5)
+    conn.search(LDAP_PEOPLE_OU, f"(uid={username})", attributes=["cn", "mail"])
+    if not conn.entries:
+        return None
+    entry = conn.entries[0]
+    return {
+        "display_name": str(entry.cn)   if entry.cn   else username,
+        "email":        str(entry.mail) if entry.mail else "",
+    }
+
 
 def require_auth(authorization: Optional[str] = Header(None)) -> dict:
     """Accept a static API token (scripts/curl) or a user JWT (browser login)."""
@@ -797,21 +814,40 @@ def clear_session(session_id: str, db: Session = Depends(get_db), _auth: dict = 
 
 class LoginRequest(BaseModel):
     username: str
-    password: str
+    password: Optional[str] = None  # not used for LDAP; kept for fallback demo users
 
 
 @app.post("/auth/login")
-def auth_login(req: LoginRequest):
-    expected = DEMO_USERS.get(req.username)
-    if not expected or expected != req.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    payload = {
-        "sub":  req.username,
-        "role": "admin" if req.username == "admin" else "user",
-        "exp":  datetime.utcnow() + timedelta(hours=JWT_EXPIRE_H),
-    }
+def auth_login(req: LoginRequest, db: Session = Depends(get_db)):
+    username = req.username.strip().lower()
+
+    try:
+        ldap_info = _ldap_lookup(username)
+    except Exception as exc:
+        logger.warning("LDAP unreachable: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Cannot reach IGS directory. Ensure you are on the IGS network.",
+        )
+
+    if not ldap_info:
+        raise HTTPException(status_code=401, detail="Username not found in IGS directory")
+
+    # Valid IGS user — update display_name in DB from LDAP
+    user = _get_or_create_user(db, username)
+    user.display_name = ldap_info["display_name"]
+    db.commit()
+
+    role = "admin" if username == "admin" else "user"
+    payload = {"sub": username, "role": role, "exp": datetime.utcnow() + timedelta(hours=JWT_EXPIRE_H)}
     token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"access_token": token, "token_type": "bearer", "username": req.username, "role": payload["role"]}
+    return {
+        "access_token": token,
+        "token_type":   "bearer",
+        "username":     username,
+        "display_name": ldap_info["display_name"],
+        "role":         role,
+    }
 
 
 @app.get("/auth/me")

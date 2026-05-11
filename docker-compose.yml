@@ -45,9 +45,10 @@ services:
       - OLLAMA_HOST=http://host.docker.internal:11434
       - EMBED_MODEL=${EMBED_MODEL:-nomic-embed-text}
 
-      # Auth — replace DEMO_USERS with LDAP once IT provides AD details
+      # Auth — LDAP for IGS user verification (anonymous search, no password needed)
       - JWT_SECRET=${JWT_SECRET:-aria-dev-secret-change-in-prod}
-      - DEMO_USERS=${DEMO_USERS:-admin:aria_demo,user1:aria_user}
+      - LDAP_HOST=${LDAP_HOST:-ldap://ldap.igs.umaryland.edu}
+      - LDAP_PEOPLE_OU=${LDAP_PEOPLE_OU:-ou=People,dc=igs,dc=umaryland,dc=edu}
 
       # SSH tools — set to enable live Slurm data (leave blank to disable)
       - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
