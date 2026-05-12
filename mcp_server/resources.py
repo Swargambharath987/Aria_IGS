@@ -4,7 +4,6 @@ Resources are read by the LLM at context-building time, not on-demand like tools
 """
 from fastmcp import FastMCP
 
-from config import settings
 from ssh import run
 
 
@@ -146,24 +145,12 @@ srun --pty --partition=defq --cpus-per-task=4 --mem=16G bash
 
     @app.resource("slurm://cluster/nodes")
     def get_cluster_nodes() -> str:
-        """Live node status from the IGS cluster via SSH."""
-        if not settings.slurm_ssh_host:
-            return "[SSH not configured — SLURM_SSH_HOST not set]"
-        out = run(
-            settings.slurm_ssh_user,
-            "module load slurm 2>/dev/null; "
-            "sinfo --Node --format='%.20N %.5c %.8m %.10T %.20P'",
-        )
+        """Live node status from the IGS cluster."""
+        out = run("", "sinfo --Node --format='%.20N %.5c %.8m %.10T %.20P'")
         return f"# IGS Cluster Nodes\n\n```\n{out}\n```"
 
     @app.resource("slurm://cluster/partitions")
     def get_cluster_partitions() -> str:
-        """Live partition info from the IGS cluster via SSH."""
-        if not settings.slurm_ssh_host:
-            return "[SSH not configured — SLURM_SSH_HOST not set]"
-        out = run(
-            settings.slurm_ssh_user,
-            "module load slurm 2>/dev/null; "
-            "sinfo --format='%.15P %.5a %.10l %.6D %.6t'",
-        )
+        """Live partition info from the IGS cluster."""
+        out = run("", "sinfo --format='%.15P %.5a %.10l %.6D %.6t'")
         return f"# IGS Cluster Partitions\n\n```\n{out}\n```"

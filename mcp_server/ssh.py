@@ -1,53 +1,40 @@
 """
-SSH executor for the Slurm MCP server.
+Slurm command executor for the MCP server.
 
-Connects as the service account (aria_service) using the mounted SSH key.
-All read commands filter by the requesting user's username.
-Write commands (sbatch, scancel) require Slurm operator privileges on aria_service —
-pending cluster admin approval from Mike/Dustin.
+Runs Slurm CLI commands as local subprocesses — Aria is deployed on the
+cluster GPU node so squeue, sacct, sinfo, seff, sbatch, scancel are
+available directly in PATH. No SSH, no service account required.
 """
-import paramiko
+import os
+import shutil
+import subprocess
 
-from config import settings
+SLURM_TIMEOUT = int(os.environ.get("SLURM_TIMEOUT", "30"))
+_SLURM_FOUND  = shutil.which("squeue") is not None
 
 
 def run(username: str, command: str) -> str:
     """
-    SSH into the Slurm login node as the service account and run a command.
-    username is passed for logging/context; the SSH connection uses slurm_ssh_user.
-
-    Returns stdout on success, or a descriptive error string on failure — never raises.
+    Run a Slurm command locally. username is used for logging/context only.
+    Returns stdout on success, or a descriptive error string — never raises.
     """
-    if not settings.slurm_ssh_host:
-        return "[MCP SSH not configured — SLURM_SSH_HOST not set in environment]"
+    if not _SLURM_FOUND:
+        return "[Slurm commands not found on this node — is squeue in PATH?]"
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        connect_kwargs: dict = {
-            "hostname": settings.slurm_ssh_host,
-            "username": settings.slurm_ssh_user,
-            "timeout":  settings.slurm_ssh_timeout,
-        }
-        if settings.slurm_ssh_key_path:
-            connect_kwargs["key_filename"] = settings.slurm_ssh_key_path
-
-        client.connect(**connect_kwargs)
-        _, stdout, stderr = client.exec_command(command, timeout=settings.slurm_ssh_timeout)
-        out = stdout.read().decode().strip()
-        err = stderr.read().decode().strip()
-        return out if out else (err if err else "(command returned no output)")
-
-    except paramiko.AuthenticationException:
-        return (
-            f"[SSH authentication failed: {settings.slurm_ssh_user}@{settings.slurm_ssh_host}. "
-            "Check that the service key is mounted at SLURM_SSH_KEY_PATH.]"
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=SLURM_TIMEOUT,
         )
-    except paramiko.SSHException as e:
-        return f"[SSH error: {e}]"
-    except TimeoutError:
-        return f"[SSH timed out connecting to {settings.slurm_ssh_host}]"
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        if result.returncode != 0 and not out:
+            return f"[Slurm error: {err or 'non-zero exit'}]"
+        return out if out else (err if err else "(no output)")
+    except subprocess.TimeoutExpired:
+        return f"[Slurm command timed out after {SLURM_TIMEOUT}s]"
     except Exception as e:
-        return f"[SSH failed: {type(e).__name__}: {e}]"
-    finally:
-        client.close()
+        return f"[Command failed: {type(e).__name__}: {e}]"

@@ -2,14 +2,12 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # SSH — IGS login node
-    slurm_ssh_host:    str = ""
-    slurm_ssh_key_path: str = "/run/secrets/slurm_key"
-    slurm_ssh_user:    str = "aria_service"
-    slurm_ssh_timeout: int = 15
+    # JWT — same secret as the Aria backend; validates user identity from Aria login
+    jwt_secret:    str = "aria-dev-secret-change-in-prod"
+    jwt_algorithm: str = "HS256"
 
-    # JWT key — validates user tokens (base64-encoded jwt_hs256.key from the cluster)
-    slurm_jwt_key: str = ""
+    # Slurm timeout for subprocess calls
+    slurm_timeout: int = 30
 
     model_config = {"env_file": ".env", "extra": "ignore"}
 

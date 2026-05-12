@@ -23,9 +23,6 @@ python-jose[cryptography]==3.3.0
 requests==2.32.3
 beautifulsoup4==4.12.3
 
-# SSH tools (Slurm live data)
-paramiko==3.5.1
-
 # LRU cache for session memory store
 cachetools==5.3.3
 

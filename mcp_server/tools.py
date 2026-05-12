@@ -1,14 +1,12 @@
 """
-MCP Tools — all Slurm operations exposed to the LLM, implemented over SSH.
+MCP Tools — all Slurm operations exposed to the LLM via subprocess.
 
 Auth flow per request:
-  1. Bearer token extracted from MCP request context
-  2. JWT validated against SLURM_JWT_KEY → username extracted
-  3. Service account (aria_service) SSH's into the login node
+  1. Bearer token (Aria JWT) extracted from MCP request context
+  2. JWT validated against JWT_SECRET → username extracted
+  3. Slurm commands run locally as subprocesses (Aria runs on the cluster node)
   4. Read commands: filtered by -u {username}
-  5. Write commands (submit, cancel): require aria_service to have Slurm operator
-     privileges — pending approval from cluster admin (Mike/Dustin).
-     They are implemented and will work once the Slurm role is granted.
+  5. Write commands (sbatch, scancel): run as the Aria deployment user
 """
 import shlex
 import tempfile
@@ -17,7 +15,6 @@ from typing import Optional
 from fastmcp import FastMCP, Context
 
 from auth import validate_token
-from config import settings
 from models import JobListFilters, JobSubmissionRequest
 from ssh import run
 
@@ -25,29 +22,20 @@ from ssh import run
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _auth(ctx: Context) -> str:
-    """Extract and validate the Bearer token. Returns the username or raises."""
+    """Extract and validate the Aria JWT. Returns the username or raises."""
     token = ""
     auth_header = (ctx.request_context.request.headers or {}).get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
 
     if not token:
-        raise ValueError(
-            "No Bearer token provided. Generate one on the cluster with: "
-            "scontrol token lifespan=3600"
-        )
+        raise ValueError("No Bearer token provided. Log in via the Aria web UI first.")
 
-    username = validate_token(token, settings.slurm_jwt_key)
+    username = validate_token(token)
     if not username:
-        raise ValueError(
-            "Invalid or expired Slurm JWT. Generate a new one with: "
-            "scontrol token lifespan=3600"
-        )
+        raise ValueError("Invalid or expired token. Please log in again via the Aria web UI.")
 
     return username
-
-
-_SLURM_PREFIX = "module load slurm 2>/dev/null; "
 
 
 def _squeue_format() -> str:
@@ -65,13 +53,12 @@ def register_tools(app: FastMCP):
         Run this first to confirm the MCP server can reach the cluster.
         """
         username = _auth(ctx)
-        out = run(username, f"{_SLURM_PREFIX}sinfo --version")
+        out = run(username, "sinfo --version")
         ok = not out.startswith("[")
         return {
-            "success":  ok,
-            "user":     username,
-            "ssh_host": settings.slurm_ssh_host,
-            "detail":   out,
+            "success": ok,
+            "user":    username,
+            "detail":  out,
         }
 
     @app.tool(tags=["job", "list", "queue"])
@@ -89,7 +76,7 @@ def register_tools(app: FastMCP):
         f = filters or JobListFilters()
         target_user = f.user or username
 
-        parts = [_SLURM_PREFIX, f"squeue -u {shlex.quote(target_user)} {_squeue_format()}"]
+        parts = [f"squeue -u {shlex.quote(target_user)} {_squeue_format()}"]
         if f.partition:
             parts.append(f"-p {shlex.quote(f.partition)}")
         if f.state:
@@ -120,7 +107,6 @@ def register_tools(app: FastMCP):
 
         # scontrol for live/queued jobs; sacct for completed ones
         cmd = (
-            f"{_SLURM_PREFIX}"
             f"scontrol show job {jid} 2>/dev/null || "
             f"sacct -j {jid} --format=JobID,JobName%30,State,Elapsed,MaxRSS,AllocCPUS,"
             f"ExitCode,NodeList --noheader"
@@ -140,7 +126,7 @@ def register_tools(app: FastMCP):
             job_id: The numeric Slurm job ID
         """
         username = _auth(ctx)
-        out = run(username, f"{_SLURM_PREFIX}seff {shlex.quote(job_id)}")
+        out = run(username, f"seff {shlex.quote(job_id)}")
         return f"Efficiency report for job {job_id}:\n{out}"
 
     @app.tool(tags=["job", "history"])
@@ -156,7 +142,6 @@ def register_tools(app: FastMCP):
         username = _auth(ctx)
         target_user = user or username
         cmd = (
-            f"{_SLURM_PREFIX}"
             f"sacct -u {shlex.quote(target_user)} "
             f"--format=JobID,JobName%30,State,Elapsed,MaxRSS,AllocCPUS,ExitCode "
             f"--starttime=now-{int(days)}days --endtime=now"
@@ -180,7 +165,7 @@ def register_tools(app: FastMCP):
         username = _auth(ctx)
 
         # Build sbatch CLI flags that override #SBATCH lines in the script
-        flags: list[str] = [f"--uid={shlex.quote(username)}"]
+        flags: list[str] = []
         if request.job_name:   flags.append(f"--job-name={shlex.quote(request.job_name)}")
         if request.partition:  flags.append(f"--partition={shlex.quote(request.partition)}")
         if request.account:    flags.append(f"--account={shlex.quote(request.account)}")
@@ -193,10 +178,7 @@ def register_tools(app: FastMCP):
 
         # Pipe the script via stdin to avoid creating temp files on the remote
         safe_script = request.script.replace("'", "'\\''")
-        cmd = (
-            f"{_SLURM_PREFIX}"
-            f"echo '{safe_script}' | sbatch {flags_str}"
-        )
+        cmd = f"echo '{safe_script}' | sbatch {flags_str}"
         out = run(username, cmd)
 
         success = "Submitted batch job" in out
@@ -209,10 +191,7 @@ def register_tools(app: FastMCP):
             "success": success,
             "job_id":  job_id,
             "message": out,
-            "note":    (
-                "Requires aria_service Slurm operator role. "
-                "If you see a permission error, contact the cluster admin."
-            ) if not success else None,
+            "note": None,
         }
 
     @app.tool(tags=["job", "cancel"])
@@ -226,7 +205,7 @@ def register_tools(app: FastMCP):
         """
         username = _auth(ctx)
         jid = shlex.quote(job_id)
-        cmd = f"{_SLURM_PREFIX}scancel --user={shlex.quote(username)} {jid}"
+        cmd = f"scancel --user={shlex.quote(username)} {jid}"
         out = run(username, cmd)
 
         # scancel outputs nothing on success
@@ -248,8 +227,8 @@ def register_tools(app: FastMCP):
         """
         username = _auth(ctx)
 
-        sinfo_cmd  = f"{_SLURM_PREFIX}sinfo --format='%.15P %.5a %.10l %.6D %.6t %N'"
-        squeue_cmd = f"{_SLURM_PREFIX}squeue {_squeue_format()} -a"
+        sinfo_cmd  = f"sinfo --format='%.15P %.5a %.10l %.6D %.6t %N'"
+        squeue_cmd = f"squeue {_squeue_format()} -a"
         if partition:
             p = shlex.quote(partition)
             sinfo_cmd  += f" -p {p}"

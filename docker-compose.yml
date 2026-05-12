@@ -50,11 +50,10 @@ services:
       - LDAP_HOST=${LDAP_HOST:-ldap://ldap.igs.umaryland.edu}
       - LDAP_PEOPLE_OU=${LDAP_PEOPLE_OU:-ou=People,dc=igs,dc=umaryland,dc=edu}
 
-      # SSH tools — set to enable live Slurm data (leave blank to disable)
-      - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
-      - SLURM_SSH_KEY_PATH=${SLURM_SSH_KEY_PATH:-}
-      - SLURM_SSH_DEFAULT_USER=${SLURM_SSH_DEFAULT_USER:-}
-      - SLURM_SSH_TIMEOUT=15
+      # Slurm — commands run as local subprocesses on the cluster node
+      # Set SLURM_ENABLED=false to disable Slurm tools when running off-cluster
+      - SLURM_ENABLED=${SLURM_ENABLED:-true}
+      - SLURM_TIMEOUT=30
 
     depends_on:
       postgres:
@@ -91,15 +90,11 @@ services:
     ports:
       - "8001:8001"
     environment:
-      # SSH access to the IGS login node (same key used by aria-backend)
-      - SLURM_SSH_HOST=${SLURM_SSH_HOST:-}
-      - SLURM_SSH_KEY_PATH=/run/secrets/slurm_key
-      - SLURM_SSH_USER=${SLURM_SSH_DEFAULT_USER:-aria_service}
-      - SLURM_SSH_TIMEOUT=15
-      # JWT key for validating per-user tokens (base64-encoded jwt_hs256.key)
-      - SLURM_JWT_KEY=${SLURM_JWT_KEY:-}
-    secrets:
-      - slurm_key
+      # Slurm commands run as local subprocesses — no SSH or service account needed
+      - SLURM_ENABLED=${SLURM_ENABLED:-true}
+      - SLURM_TIMEOUT=30
+      # JWT secret — same as aria-backend, validates Aria login tokens
+      - JWT_SECRET=${JWT_SECRET:-aria-dev-secret-change-in-prod}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/sse"]
       interval: 10s
@@ -110,7 +105,3 @@ services:
 
 volumes:
   postgres_data:
-
-secrets:
-  slurm_key:
-    file: ${SLURM_SSH_KEY_PATH:-/dev/null}
