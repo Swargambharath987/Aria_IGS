@@ -112,12 +112,15 @@ def read_file(username: str, path: str) -> str:
             f"Readable types: .sh .slurm .sbatch .out .err .log .py .R .txt .yaml .yml]"
         )
 
-    out = _run(
-        username,
-        f"test -f '{safe_path}' && head -n {_MAX_LINES} '{safe_path}' || echo '[File not found: {safe_path}]'",
-    )
-    if not out or out.startswith("[SSH"):
+    # Run head directly — stderr is captured so permission denied and missing file
+    # errors surface clearly to the LLM rather than being swallowed.
+    out = _run(username, f"head -n {_MAX_LINES} '{safe_path}' 2>&1")
+    if not out or out.startswith("[Slurm"):
         return out or "[File read returned no output]"
+    if "Permission denied" in out:
+        return f"[Permission denied reading '{safe_path}' — this file is not accessible to Aria on this deployment]"
+    if "No such file" in out:
+        return f"[File not found: '{safe_path}' — check the path is correct]"
 
     line_count_out = _run(username, f"wc -l < '{safe_path}' 2>/dev/null")
     try:
@@ -152,7 +155,7 @@ def list_job_files(username: str, directory: str) -> str:
         username,
         f"ls -lhrt '{directory}' 2>/dev/null | grep -E '\\.({exts})$' | tail -30",
     )
-    if not out or out.startswith("[SSH"):
+    if not out or out.startswith("[Slurm"):
         return out or f"[No job files found in {directory}]"
 
     return f"Files in {directory}:\n{out}"

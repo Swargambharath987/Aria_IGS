@@ -111,6 +111,8 @@ def job_history(username: str, days: int = 7) -> str:
 
 
 def job_efficiency(username: str, job_id: str) -> str:
+    if not str(job_id).isdigit():
+        return f"[Invalid job ID '{job_id}' — must be a numeric Slurm job ID]"
     out = _run(username, f"seff {job_id}")
     return f"Efficiency report for job {job_id}:\n{out}"
 

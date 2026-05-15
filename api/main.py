@@ -14,6 +14,7 @@ from typing import List, Optional
 from urllib.parse import urlparse
 
 import cachetools
+from cachetools import TTLCache
 
 import requests as http_requests
 from bs4 import BeautifulSoup
@@ -81,6 +82,22 @@ LDAP_PEOPLE_OU  = os.environ.get("LDAP_PEOPLE_OU",  "ou=People,dc=igs,dc=umaryla
 # The agent itself is stateless and rebuilt per request; only memory is cached.
 _memories: cachetools.LRUCache = cachetools.LRUCache(maxsize=50)
 _memories_lock: threading.Lock = threading.Lock()
+
+# Rate limiting: max requests per user per 60-second window on chat endpoints
+_RATE_LIMIT_MAX = int(os.environ.get("RATE_LIMIT_MAX", "10"))
+_rate_limit_cache: TTLCache = TTLCache(maxsize=1000, ttl=60)
+_rate_limit_lock: threading.Lock = threading.Lock()
+
+
+def _check_rate_limit(username: str) -> None:
+    with _rate_limit_lock:
+        count = _rate_limit_cache.get(username, 0)
+        if count >= _RATE_LIMIT_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded — max {_RATE_LIMIT_MAX} chat requests per minute per user.",
+            )
+        _rate_limit_cache[username] = count + 1
 
 
 # ── Auth ───────────────────────────────────────────────────────────────────
@@ -501,6 +518,7 @@ async def chat(req: ChatRequest, db: Session = Depends(get_db), _auth: dict = De
 
     session_id = req.session_id or str(uuid.uuid4())
     username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
+    _check_rate_limit(username)
 
     # Load user profile before building tools so context can be injected
     user = _get_or_create_user(db, username)
@@ -550,6 +568,7 @@ async def chat_stream(req: ChatRequest, _auth: dict = Depends(require_auth)):
 
     session_id = req.session_id or str(uuid.uuid4())
     username   = _auth.get("username") if _auth.get("username") != "api" else req.user_id
+    _check_rate_limit(username)
     source_sink: list = []
 
     # Fetch user profile and restore memory before the generator starts
