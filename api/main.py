@@ -37,6 +37,7 @@ from llama_index.embeddings.ollama import OllamaEmbedding
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.vector_stores.chroma import ChromaVectorStore
 from pydantic import BaseModel
+from sqlalchemy import func as sqlfunc
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -691,15 +692,21 @@ def list_sessions(user_id: str = "dev", db: Session = Depends(get_db), _auth: di
         .limit(50)
         .all()
     )
+    session_ids = [s.id for s in sessions]
+    counts = dict(
+        db.query(Message.session_id, sqlfunc.count(Message.id))
+        .filter(Message.session_id.in_(session_ids))
+        .group_by(Message.session_id)
+        .all()
+    ) if session_ids else {}
     result = []
     for s in sessions:
-        count = db.query(Message).filter(Message.session_id == s.id).count()
         result.append(SessionSummary(
             session_id=str(s.id),
             title=s.title,
             created_at=s.created_at.isoformat(),
             last_active_at=s.last_active_at.isoformat(),
-            message_count=count,
+            message_count=counts.get(s.id, 0),
         ))
     return result
 
@@ -955,7 +962,6 @@ def admin_delete_doc(doc_id: str, db: Session = Depends(get_db), _auth: dict = D
 
 @app.get("/admin/stats", response_model=StatsOut)
 def admin_stats(db: Session = Depends(get_db), _auth: dict = Depends(require_auth)):
-    from sqlalchemy import func as sqlfunc
 
     total_users    = db.query(sqlfunc.count(User.id)).scalar() or 0
     total_sessions = db.query(sqlfunc.count(DBSession.id)).scalar() or 0

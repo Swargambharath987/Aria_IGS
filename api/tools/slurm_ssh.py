@@ -19,6 +19,10 @@ SLURM_TIMEOUT = int(os.environ.get("SLURM_TIMEOUT", "30"))
 # Detect whether Slurm is actually installed on this node at startup.
 _SLURM_FOUND = shutil.which("squeue") is not None
 
+# Exported alias used by agent_tools.py — true when both the env var allows it
+# and the Slurm binaries are actually present.
+SSH_AVAILABLE = SLURM_ENABLED and _SLURM_FOUND
+
 
 def _run(username: str, command: str) -> str:
     """

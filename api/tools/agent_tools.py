@@ -123,7 +123,7 @@ def build_tools(
         this always queries for the current authenticated user.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — live cluster data unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": "Live Job Queue", "tool": "get_job_status"})
         return job_status(username)
 
@@ -136,7 +136,7 @@ def build_tools(
         7 days; pass a different number of days if the user specifies.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — live cluster data unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": f"Job History (last {days}d)", "tool": "get_job_history"})
         return job_history(username, days)
 
@@ -152,7 +152,7 @@ def build_tools(
         Requires: job_id — the numeric Slurm job ID extracted from the message.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — live cluster data unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": f"Job Efficiency (job {job_id})", "tool": "get_job_efficiency"})
         return job_efficiency(username, job_id)
 
@@ -167,7 +167,7 @@ def build_tools(
         - Which partitions exist and what they support
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — live cluster data unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": "Live Cluster Status", "tool": "get_cluster_status"})
         return cluster_status()
 
@@ -185,7 +185,7 @@ def build_tools(
         Only files within the user's home directory are accessible.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — file reading unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": f"File: {path}", "tool": "read_user_file"})
         return read_file(username, path)
 
@@ -198,7 +198,7 @@ def build_tools(
         e.g. "list my scripts in ~/jobs" or "what .sh files are in ~/slurm".
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — file listing unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
         source_sink.append({"type": "tool", "label": f"Directory: {directory}", "tool": "list_user_files"})
         return list_job_files(username, directory)
 
@@ -230,7 +230,7 @@ def build_tools(
         Approve / Deny card. The job is NOT submitted until the user approves.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — job submission unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
 
         _expire_pending_actions()
 
@@ -279,7 +279,7 @@ def build_tools(
         Approve / Deny card. The job is NOT cancelled until the user approves.
         """
         if not SSH_AVAILABLE:
-            return "[SSH not configured — job cancellation unavailable. Set SLURM_SSH_HOST to enable.]"
+            return "[Slurm tools not available — set SLURM_ENABLED=true and ensure squeue is in PATH.]"
 
         _expire_pending_actions()
 
